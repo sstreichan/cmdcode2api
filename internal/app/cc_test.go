@@ -155,9 +155,110 @@ func TestMarshaledCCRequestUsesExactStructuredHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"config":{"workingDir":"/","date":"2026-01-02","environment":"test","structure":[],"isGitRepo":false,"currentBranch":"","mainBranch":"","gitStatus":"","recentCommits":[]},"memory":"","taste":"","skills":null,"permissionMode":"standard","params":{"model":"m","messages":[{"role":"assistant","content":[{"type":"reasoning","text":"think"},{"type":"text","text":"calling"},{"type":"tool-call","toolCallId":"call-1","toolName":"lookup","input":{"id":12345678901234567890}}]},{"role":"tool","content":[{"type":"tool-result","toolCallId":"call-1","toolName":"lookup","output":{"type":"text","value":"ok"}}]}],"tools":[],"system":"system","max_tokens":64000,"stream":true}}`
+	want := `{"config":{"workingDir":"/","date":"2026-01-02","environment":"test","structure":[],"isGitRepo":false,"currentBranch":"","mainBranch":"","gitStatus":"","recentCommits":[]},"memory":null,"taste":null,"skills":"","permissionMode":"standard","params":{"model":"m","messages":[{"role":"assistant","content":[{"type":"reasoning","text":"think"},{"type":"text","text":"calling"},{"type":"tool-call","toolCallId":"call-1","toolName":"lookup","input":{"id":12345678901234567890}}]},{"role":"tool","content":[{"type":"tool-result","toolCallId":"call-1","toolName":"lookup","output":{"type":"text","value":"ok"}}]}],"tools":[],"system":"system","max_tokens":64000,"stream":true}}`
 	if string(encoded) != want {
 		t.Fatalf("CCRequest wire JSON changed:\n got: %s\nwant: %s", encoded, want)
+	}
+}
+
+func TestOpenAIToCCSendsCLIEnvelopeValues(t *testing.T) {
+	got, err := openAIToCC(&ChatRequest{
+		Model:    "m",
+		Messages: []Message{{Role: "user", Content: TextContent("hi")}},
+	})
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	// memory/taste are null and skills is an empty string in the CLI envelope.
+	for _, want := range []string{`"memory":null`, `"taste":null`, `"skills":""`} {
+		if !strings.Contains(string(encoded), want) {
+			t.Errorf("CC request is missing %s: %s", want, encoded)
+		}
+	}
+}
+
+func TestOpenAIToCCUsesNodeShapedEnvironment(t *testing.T) {
+	env := cliEnvironment()
+	if !strings.Contains(env, ", Node.js v") {
+		t.Fatalf("environment = %q, want the CLI's Node-shaped value", env)
+	}
+	if strings.Contains(env, "Go") || strings.Contains(env, "go proxy") {
+		t.Fatalf("environment = %q, must not leak the Go runtime", env)
+	}
+	switch platform := strings.SplitN(env, "-", 2)[0]; platform {
+	case "win32", "darwin", "linux", "freebsd":
+	default:
+		t.Fatalf("environment = %q has an unexpected platform %q", env, platform)
+	}
+}
+
+func TestOpenAIToCCReportsWorkingDirectory(t *testing.T) {
+	dir := cliWorkingDir()
+	if dir == "" || dir == "/" {
+		t.Fatalf("workingDir = %q, want the process working directory", dir)
+	}
+}
+
+func TestOpenAIToCCUsesUTCDateLikeTheCLI(t *testing.T) {
+	// 02:00 on 2026-01-02 at UTC+13 is still 2026-01-01 in UTC, so a local
+	// date would silently differ from the reference CLI's toISOString() value.
+	loc := time.FixedZone("UTC+13", 13*60*60)
+	now := time.Date(2026, time.January, 2, 2, 0, 0, 0, loc)
+	if got := cliConfigDate(now); got != "2026-01-01" {
+		t.Fatalf("config.date = %q, want the UTC date 2026-01-01", got)
+	}
+}
+
+func TestOpenAIToCCFillsEmptySystemPromptLikeTheCLI(t *testing.T) {
+	req := func() *ChatRequest {
+		return &ChatRequest{Model: "m", Messages: []Message{{Role: "user", Content: TextContent("hi")}}}
+	}
+
+	got, err := openAIToCC(req())
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	if got.Params.System != emptySystemPlaceholder {
+		t.Fatalf("system = %q, want the placeholder %q", got.Params.System, emptySystemPlaceholder)
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"system":" "`) {
+		t.Fatalf("placeholder missing from the CC request: %s", encoded)
+	}
+
+	// An explicit system prompt is passed through untouched.
+	withSystem, err := openAIToCC(&ChatRequest{Model: "m", Messages: []Message{
+		{Role: "system", Content: TextContent("be terse")},
+		{Role: "user", Content: TextContent("hi")},
+	}})
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	if withSystem.Params.System != "be terse" {
+		t.Fatalf("system = %q, want the client's prompt", withSystem.Params.System)
+	}
+
+	// Disabling the placeholder omits the field again.
+	previous := emptySystemPlaceholder
+	emptySystemPlaceholder = ""
+	t.Cleanup(func() { emptySystemPlaceholder = previous })
+	disabled, err := openAIToCC(req())
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	encoded, err = json.Marshal(disabled)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(encoded), `"system"`) {
+		t.Fatalf("system must be omitted when the placeholder is disabled: %s", encoded)
 	}
 }
 

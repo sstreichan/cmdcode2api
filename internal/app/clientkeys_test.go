@@ -10,6 +10,39 @@ import (
 	"testing"
 )
 
+func TestClientKeyPoolMissingAndSkippedEntries(t *testing.T) {
+	// Blank keys are skipped when loading a config list.
+	pool := NewClientKeyPool([]ClientKeyConfig{
+		{Name: "blank", Key: "   "},
+		{Name: "real", Key: "ccgw-real"},
+	})
+	if pool.Len() != 1 {
+		t.Fatalf("pool length = %d, want 1 (blank key skipped)", pool.Len())
+	}
+	if pool.Get("does-not-exist") != nil {
+		t.Fatal("Get(unknown) returned a key")
+	}
+
+	// Mutations on an unknown id report false and change nothing.
+	if pool.Remove("does-not-exist") {
+		t.Fatal("Remove(unknown) = true")
+	}
+	if pool.SetEnabled("does-not-exist", false) {
+		t.Fatal("SetEnabled(unknown) = true")
+	}
+	if pool.Rename("does-not-exist", "x") {
+		t.Fatal("Rename(unknown) = true")
+	}
+	if pool.Len() != 1 || pool.EnabledCount() != 1 {
+		t.Fatalf("failed mutations changed the pool: len=%d enabled=%d", pool.Len(), pool.EnabledCount())
+	}
+
+	// Duplicate values are rejected by value, not by name.
+	if _, err := pool.Add("another", "ccgw-real", true); err == nil {
+		t.Fatal("Add with a duplicate key value must fail")
+	}
+}
+
 func TestClientKeyPoolBasics(t *testing.T) {
 	pool := NewClientKeyPool(nil)
 

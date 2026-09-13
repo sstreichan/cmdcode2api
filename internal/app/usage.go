@@ -39,6 +39,16 @@ type UsageCounters struct {
 
 func (c *UsageCounters) add(prompt, completion, cacheRead, cacheWrite int) {
 	c.Requests.Add(1)
+	c.addTokens(prompt, completion, cacheRead, cacheWrite)
+}
+
+// addPartial records tokens without counting a request, for zero-output
+// responses that must not look like successes.
+func (c *UsageCounters) addPartial(prompt, completion, cacheRead, cacheWrite int) {
+	c.addTokens(prompt, completion, cacheRead, cacheWrite)
+}
+
+func (c *UsageCounters) addTokens(prompt, completion, cacheRead, cacheWrite int) {
 	c.PromptTokens.Add(int64(prompt))
 	c.CompletionTokens.Add(int64(completion))
 	if cacheRead > 0 {
@@ -69,6 +79,16 @@ func (c *UsageCounters) snapshot() UsageSnapshotEntry {
 
 func (u *UsageTracker) Record(prompt, completion, cacheRead, cacheWrite int) {
 	u.TotalRequests.Add(1)
+	u.recordTokens(prompt, completion, cacheRead, cacheWrite)
+}
+
+// RecordPartial books tokens without incrementing the request counter. Used by
+// the zero-output guard, where the request must not count as a success.
+func (u *UsageTracker) RecordPartial(prompt, completion, cacheRead, cacheWrite int) {
+	u.recordTokens(prompt, completion, cacheRead, cacheWrite)
+}
+
+func (u *UsageTracker) recordTokens(prompt, completion, cacheRead, cacheWrite int) {
 	u.PromptTokens.Add(int64(prompt))
 	u.CompletionTokens.Add(int64(completion))
 	if cacheRead > 0 {
@@ -118,6 +138,16 @@ func (r *mirrorUsageRecorder) Record(prompt, completion, cacheRead, cacheWrite i
 	}
 	if c := r.tracker.clientKeyCounter(r.clientKeyID); c != nil {
 		c.add(prompt, completion, cacheRead, cacheWrite)
+	}
+}
+
+func (r *mirrorUsageRecorder) RecordPartial(prompt, completion, cacheRead, cacheWrite int) {
+	r.tracker.RecordPartial(prompt, completion, cacheRead, cacheWrite)
+	if c := r.tracker.accountCounter(r.accountID); c != nil {
+		c.addPartial(prompt, completion, cacheRead, cacheWrite)
+	}
+	if c := r.tracker.clientKeyCounter(r.clientKeyID); c != nil {
+		c.addPartial(prompt, completion, cacheRead, cacheWrite)
 	}
 }
 

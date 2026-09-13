@@ -322,6 +322,13 @@
         <span class="cap">Base URL（即时生效）</span>
         <input type="text" id="set-baseurl" class="mono">
       </label>
+      <div class="form-row" style="margin-top:10px">
+        <label class="field"><span class="cap">CLI 版本（x-command-code-version）</span>
+          <input type="text" id="set-cliver" class="mono" readonly>
+        </label>
+        <button class="btn" id="set-cliver-refresh">刷新</button>
+      </div>
+      <p class="hint">版本每 24 小时自动从 npm registry 刷新；失败时沿用缓存或内置回退值，不会影响请求。</p>
     </div>
     <div class="panel">
       <h3>服务</h3>
@@ -656,6 +663,7 @@ function renderAccounts(accounts) {
       <th style="text-align:right">Tokens</th>
       <th style="text-align:right">错误</th>
       <th>最近使用</th>
+      <th>指纹 / 会话</th>
       <th style="text-align:right">操作</th>
     </tr></thead>
     <tbody>
@@ -669,14 +677,17 @@ function renderAccounts(accounts) {
         <td class="num" style="text-align:right">${fmtTokens(tokens)}</td>
         <td class="num" style="text-align:right">${a.errors ? `<span style="color:var(--red)">${a.errors}</span>` : "0"}</td>
         <td class="nowrap dim">${esc(relTime(a.last_used_at))}</td>
+        <td class="mono dim" title="${esc(a.fingerprint_profile ? (a.fingerprint_profile.cpu_model + " · " + a.fingerprint_profile.memory_gib + " GiB · " + a.fingerprint_profile.timezone) : "")}">${a.fingerprint_short ? esc(a.fingerprint_short) + "<br><span class='faint'>会话至 " + esc(inTime(a.session_expires_at)) + "</span>" : "—"}</td>
         <td><div class="row-actions">
           <button class="btn small" onclick="testAccount('${a.id}')">测试</button>
           <button class="btn small" onclick="openAccountEdit('${a.id}', '${esc(a.name)}')">编辑</button>
+          <button class="btn small" onclick="reRecordAccount('${a.id}')">重录指纹</button>
+          <button class="btn small" onclick="newAccountSession('${a.id}')">新会话</button>
           <button class="btn small" onclick="toggleAccount('${a.id}', ${a.enabled ? "false" : "true"})">${a.enabled ? "禁用" : "启用"}</button>
           <button class="btn small danger" onclick="deleteAccount('${a.id}', '${esc(a.name)}')">删除</button>
         </div></td>
       </tr>
-      ${a.last_error ? `<tr><td colspan="8" class="err-line">最近错误（${esc(relTime(a.last_error_at))}）：${esc(a.last_error)}</td></tr>` : ""}
+      ${a.last_error ? `<tr><td colspan="9" class="err-line">最近错误（${esc(relTime(a.last_error_at))}）：${esc(a.last_error)}</td></tr>` : ""}
     `;}).join("")}
     </tbody>
   </table>`;
@@ -690,6 +701,24 @@ async function addAccount() {
     await api("/admin/api/accounts", { method: "POST", body: { name, api_key: key } });
     $("#acc-key").value = ""; $("#acc-name").value = "";
     toast("账号已添加");
+    refreshAll();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function reRecordAccount(id) {
+  try {
+    const r = await api("/admin/api/accounts/" + id + "/fingerprint", { method: "POST" });
+    if (r.error) toast("指纹已重录，但上游返回错误：" + r.error, true);
+    else toast("已重新录制指纹");
+    refreshAll();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function newAccountSession(id) {
+  try {
+    const r = await api("/admin/api/accounts/" + id + "/session", { method: "POST" });
+    if (r.error) toast("会话已轮换，但上游返回错误：" + r.error, true);
+    else toast("已创建新会话");
     refreshAll();
   } catch (e) { toast(e.message, true); }
 }
@@ -914,6 +943,23 @@ async function loadSettings() {
     $("#set-password").value = "";
     $("#set-password-old").value = "";
   } catch (e) { /* 401 已处理 */ }
+  loadCLIVersion();
+}
+
+async function loadCLIVersion() {
+  try {
+    const v = await api("/admin/api/cliversion");
+    $("#set-cliver").value = v.version + " · " + (v.source === "npm" ? "npm" : "内置回退");
+  } catch (e) { /* 401 已处理 */ }
+}
+
+async function refreshCLIVersion() {
+  try {
+    const v = await api("/admin/api/cliversion/refresh", { method: "POST" });
+    $("#set-cliver").value = v.version + " · " + (v.source === "npm" ? "npm" : "内置回退");
+    if (v.error) toast("刷新失败，沿用 " + v.version + "：" + v.error, true);
+    else toast("CLI 版本已刷新：" + v.version);
+  } catch (e) { toast(e.message, true); }
 }
 
 async function saveSettings() {
@@ -1065,6 +1111,7 @@ $("#oauth-cancel").addEventListener("click", () => {
 $("#oauth-modal").addEventListener("click", e => { if (e.target === $("#oauth-modal")) hideModal("#oauth-modal"); });
 
 $("#set-save-btn").addEventListener("click", saveSettings);
+$("#set-cliver-refresh").addEventListener("click", refreshCLIVersion);
 
 $("#pw-form").addEventListener("submit", async e => {
   e.preventDefault();

@@ -74,7 +74,9 @@ func (a *Account) RecordFailure(err error) {
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.lastError = err.Error()
+	// lastError is surfaced verbatim in the admin API, so strip credentials
+	// and key-shaped tokens before storing it.
+	a.lastError = redactText(err.Error())
 	a.lastErrorAt = now
 
 	var upstreamErr *upstreamAPIError
@@ -158,6 +160,17 @@ type AccountPool struct {
 	mu       sync.RWMutex
 	accounts []*Account
 	cursor   atomic.Uint64
+
+	// detection, when set, has per-key state dropped on removal/rotation.
+	detection *DetectionStore
+}
+
+// SetDetectionStore wires the detection store so key rotation/removal also
+// invalidates the affected fingerprint/session state.
+func (p *AccountPool) SetDetectionStore(store *DetectionStore) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.detection = store
 }
 
 func NewAccountPool(list []AccountConfig) *AccountPool {
@@ -242,9 +255,9 @@ func (p *AccountPool) Get(id string) *Account {
 var errDuplicateAccount = errors.New("an account with this key already exists")
 
 func (p *AccountPool) Add(name, apiKey string, enabled bool) (*Account, error) {
-	apiKey = strings.TrimSpace(apiKey)
-	if apiKey == "" {
-		return nil, fmt.Errorf("api_key is required")
+	apiKey, err := resolveAccountKey(name, apiKey)
+	if err != nil {
+		return nil, err
 	}
 	if id := accountID(apiKey); p.Get(id) != nil {
 		return nil, errDuplicateAccount
@@ -258,14 +271,21 @@ func (p *AccountPool) Add(name, apiKey string, enabled bool) (*Account, error) {
 
 func (p *AccountPool) Remove(id string) bool {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	removed := false
 	for i, a := range p.accounts {
 		if a.ID == id {
 			p.accounts = append(p.accounts[:i], p.accounts[i+1:]...)
-			return true
+			removed = true
+			break
 		}
 	}
-	return false
+	store := p.detection
+	p.mu.Unlock()
+	// State is dropped outside the pool lock; persistence does file IO.
+	if removed && store != nil {
+		store.Forget(id)
+	}
+	return removed
 }
 
 func (p *AccountPool) SetEnabled(id string, enabled bool) bool {
@@ -290,14 +310,14 @@ func (p *AccountPool) Rename(id, name string) bool {
 // the account's ID changes too; the caller is responsible for migrating usage
 // counters (UsageTracker.MoveAccount).
 func (p *AccountPool) SetKey(id, newKey string) (string, error) {
-	newKey = strings.TrimSpace(newKey)
-	if newKey == "" {
-		return "", fmt.Errorf("api_key cannot be empty")
+	key, err := resolveAccountKey("", newKey)
+	if err != nil {
+		return "", err
 	}
+	newKey = key
 	newID := accountID(newKey)
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	var a *Account
 	for _, cand := range p.accounts {
 		if cand.ID == id {
@@ -306,17 +326,28 @@ func (p *AccountPool) SetKey(id, newKey string) (string, error) {
 		}
 	}
 	if a == nil {
+		p.mu.Unlock()
 		return "", fmt.Errorf("account not found")
 	}
 	for _, other := range p.accounts {
 		if other != a && other.ID == newID {
+			p.mu.Unlock()
 			return "", errDuplicateAccount
 		}
 	}
+	oldID := a.ID
 	a.mu.Lock()
 	a.APIKey = newKey
 	a.ID = newID
 	a.mu.Unlock()
+	store := p.detection
+	p.mu.Unlock()
+
+	// A rotated key must not inherit the previous key's device identity: a
+	// shared profile across keys would make the accounts linkable upstream.
+	if store != nil && oldID != newID {
+		store.Forget(oldID)
+	}
 	return newID, nil
 }
 

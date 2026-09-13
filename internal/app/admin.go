@@ -16,11 +16,14 @@ import (
 // mounted behind adminAuth.
 func registerAdminRoutes(mux *http.ServeMux, cc *CCClient, pool *AccountPool, keys *ClientKeyPool, cfg *Config, usage *UsageTracker, ring *logRing) {
 	mux.HandleFunc("GET /admin/api/overview", handleAdminOverview(cfg, pool, keys, usage))
-	mux.HandleFunc("GET /admin/api/accounts", handleAdminAccountsList(pool, usage))
+	mux.HandleFunc("GET /admin/api/accounts", handleAdminAccountsList(pool, usage, cc))
 	mux.HandleFunc("POST /admin/api/accounts", handleAdminAccountAdd(pool, cfg, usage))
 	mux.HandleFunc("PATCH /admin/api/accounts/{id}", handleAdminAccountPatch(pool, cfg, usage))
 	mux.HandleFunc("DELETE /admin/api/accounts/{id}", handleAdminAccountDelete(pool, cfg, usage))
 	mux.HandleFunc("POST /admin/api/accounts/{id}/test", handleAdminAccountTest(pool, cc))
+	mux.HandleFunc("GET /admin/api/detection", handleAdminDetection(cc))
+	mux.HandleFunc("POST /admin/api/accounts/{id}/fingerprint", handleAdminAccountFingerprint(pool, cc))
+	mux.HandleFunc("POST /admin/api/accounts/{id}/session", handleAdminAccountSession(pool, cc))
 	mux.HandleFunc("GET /admin/api/models", handleAdminModelsGet(cfg))
 	mux.HandleFunc("PUT /admin/api/models", handleAdminModelsPut(cfg))
 	mux.HandleFunc("GET /admin/api/keys", handleAdminKeysList(keys, usage))
@@ -30,6 +33,8 @@ func registerAdminRoutes(mux *http.ServeMux, cc *CCClient, pool *AccountPool, ke
 	mux.HandleFunc("GET /admin/api/keys/{id}/reveal", handleAdminKeyReveal(keys))
 	mux.HandleFunc("GET /admin/api/settings", handleAdminSettingsGet(cfg))
 	mux.HandleFunc("PUT /admin/api/settings", handleAdminSettingsPut(cfg, cc, pool))
+	mux.HandleFunc("GET /admin/api/cliversion", handleAdminCLIVersion(cc))
+	mux.HandleFunc("POST /admin/api/cliversion/refresh", handleAdminCLIVersionRefresh(cc))
 	mux.HandleFunc("GET /admin/api/logs", handleAdminLogs(ring))
 	mux.HandleFunc("POST /admin/api/oauth/start", handleAdminOAuthStart(pool, cfg))
 	mux.HandleFunc("GET /admin/api/oauth/status", handleAdminOAuthStatus(pool))
@@ -52,19 +57,96 @@ func subtleConstantTimeEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
-// adminAccount merges the ephemeral health view with durable usage counters.
+// adminAccount merges the ephemeral health view with durable usage counters
+// and the account's persisted detection state.
 type adminAccount struct {
 	AccountView
 	UsageSnapshotEntry
+
+	FingerprintShort     string              `json:"fingerprint_short,omitempty"`
+	FingerprintProfile   *FingerprintProfile `json:"fingerprint_profile,omitempty"`
+	FingerprintRefreshAt string              `json:"fingerprint_refresh_at,omitempty"`
+	SessionExpiresAt     string              `json:"session_expires_at,omitempty"`
 }
 
-func adminAccountViews(pool *AccountPool, usage *UsageTracker) []adminAccount {
+func adminAccountViews(pool *AccountPool, usage *UsageTracker, detection *DetectionStore) []adminAccount {
 	views := pool.Views()
 	out := make([]adminAccount, 0, len(views))
 	for _, v := range views {
-		out = append(out, adminAccount{AccountView: v, UsageSnapshotEntry: usage.AccountUsage(v.ID)})
+		entry := adminAccount{AccountView: v, UsageSnapshotEntry: usage.AccountUsage(v.ID)}
+		if detection != nil {
+			if state, ok := detection.State(v.ID); ok {
+				profile := state.Profile
+				entry.FingerprintShort = FingerprintShort(state.Fingerprint)
+				entry.FingerprintProfile = &profile
+				entry.FingerprintRefreshAt = detectionTimeString(state.FingerprintRefreshAt)
+				entry.SessionExpiresAt = detectionTimeString(state.SessionExpiresAt)
+			}
+		}
+		out = append(out, entry)
 	}
 	return out
+}
+
+// handleAdminDetection exposes the persisted detection state in short form.
+func handleAdminDetection(cc *CCClient) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		accounts := map[string]any{}
+		if store := cc.DetectionStore(); store != nil {
+			for id, state := range store.Snapshot() {
+				accounts[id] = map[string]any{
+					"fingerprint_short":      FingerprintShort(state.Fingerprint),
+					"profile":                state.Profile,
+					"fingerprint_refresh_at": detectionTimeString(state.FingerprintRefreshAt),
+					"session_expires_at":     detectionTimeString(state.SessionExpiresAt),
+					"base_url":               state.BaseURL,
+				}
+			}
+		}
+		writeAdminJSON(w, 200, map[string]any{"accounts": accounts})
+	}
+}
+
+func handleAdminAccountFingerprint(pool *AccountPool, cc *CCClient) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		account := pool.Get(r.PathValue("id"))
+		if account == nil {
+			writeAdminError(w, 404, "account not found")
+			return
+		}
+		store := cc.DetectionStore()
+		if store == nil {
+			writeAdminError(w, 400, "detection store is not configured")
+			return
+		}
+		store.ReRecord(account.ID, cc.BaseURLValue())
+		errMsg := ""
+		if err := cc.RecordFingerprint(r.Context(), account); err != nil {
+			errMsg = err.Error()
+		}
+		writeAdminJSON(w, 200, map[string]any{"fingerprint": 1, "error": errMsg})
+	}
+}
+
+func handleAdminAccountSession(pool *AccountPool, cc *CCClient) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		account := pool.Get(r.PathValue("id"))
+		if account == nil {
+			writeAdminError(w, 404, "account not found")
+			return
+		}
+		store := cc.DetectionStore()
+		if store == nil {
+			writeAdminError(w, 400, "detection store is not configured")
+			return
+		}
+		store.NewSession(account.ID, cc.BaseURLValue())
+		errMsg := ""
+		if err := cc.RecordLifecycle(r.Context(), account); err != nil {
+			errMsg = err.Error()
+		}
+		writeAdminJSON(w, 200, map[string]any{"lifecycle": 1, "error": errMsg})
+	}
 }
 
 func handleAdminOverview(cfg *Config, pool *AccountPool, keys *ClientKeyPool, usage *UsageTracker) http.HandlerFunc {
@@ -119,9 +201,9 @@ type adminModelsSummary struct {
 	Available int `json:"available"`
 }
 
-func handleAdminAccountsList(pool *AccountPool, usage *UsageTracker) http.HandlerFunc {
+func handleAdminAccountsList(pool *AccountPool, usage *UsageTracker, cc *CCClient) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		writeAdminJSON(w, 200, map[string]any{"accounts": adminAccountViews(pool, usage)})
+		writeAdminJSON(w, 200, map[string]any{"accounts": adminAccountViews(pool, usage, cc.DetectionStore())})
 	}
 }
 
@@ -633,15 +715,10 @@ func handleAdminOAuthStart(pool *AccountPool, cfg *Config) http.HandlerFunc {
 			writeAdminError(w, 500, err.Error())
 			return
 		}
-		webOAuthFlow = flow
-		webOAuthMu.Unlock()
-
-		go func() {
-			cb, err := flow.Wait(oauthTimeout)
-			if err != nil {
-				log.Printf("[WARN] webui oauth flow ended: %v", err)
-				return
-			}
+		// The account is added and persisted inside the flow's completion hook,
+		// which runs before the flow reports success. Without this the WebUI
+		// (and tests) could observe "success" and still find no account.
+		flow.SetOnSuccess(func(cb oauthCallback) error {
 			name := cb.displayName()
 			if name == "" {
 				name = "oauth"
@@ -649,20 +726,65 @@ func handleAdminOAuthStart(pool *AccountPool, cfg *Config) http.HandlerFunc {
 			acct, err := pool.Add(name, cb.APIKey, true)
 			if err != nil {
 				log.Printf("[WARN] webui oauth: add account failed: %v", err)
-				return
+				return err
 			}
 			if err := persistPool(pool, cfg); err != nil {
 				log.Printf("[WARN] webui oauth: save config failed: %v", err)
-				return
+				return err
 			}
 			if len(modelCatalog) == 0 && acct.Enabled {
 				FetchProviderModels(cfg.UpstreamBaseURL(), acct.APIKey)
 			}
 			log.Printf("✓ OAuth account %q added via webui (user %s)", acct.Name, cb.UserName)
+			return nil
+		})
+		webOAuthFlow = flow
+		webOAuthMu.Unlock()
+
+		go func() {
+			if _, err := flow.Wait(oauthTimeout); err != nil {
+				log.Printf("[WARN] webui oauth flow ended: %v", err)
+			}
 		}()
 
 		writeAdminJSON(w, 200, map[string]any{"state": "pending", "auth_url": flow.AuthURL})
 	}
+}
+
+// handleAdminCLIVersion reports the advertised CLI version and where it came
+// from (npm registry vs. the bundled fallback).
+func handleAdminCLIVersion(cc *CCClient) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeAdminJSON(w, 200, cliVersionPayload(cc, ""))
+	}
+}
+
+// handleAdminCLIVersionRefresh re-reads the npm registry on demand. A registry
+// failure is reported in the payload but does not fail the request: the cached
+// version (or fallback) keeps being advertised.
+func handleAdminCLIVersionRefresh(cc *CCClient) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		provider := cc.VersionProvider()
+		errMsg := ""
+		if err := provider.Refresh(); err != nil {
+			errMsg = err.Error()
+			log.Printf("[WARN] manual CLI version refresh failed, keeping %s: %v", provider.Current(), err)
+		}
+		writeAdminJSON(w, 200, cliVersionPayload(cc, errMsg))
+	}
+}
+
+func cliVersionPayload(cc *CCClient, errMsg string) map[string]any {
+	provider := cc.VersionProvider()
+	payload := map[string]any{
+		"version":  provider.Current(),
+		"source":   provider.Source(),
+		"fallback": fallbackCLIVersion,
+	}
+	if errMsg != "" {
+		payload["error"] = errMsg
+	}
+	return payload
 }
 
 func handleAdminOAuthStatus(pool *AccountPool) http.HandlerFunc {

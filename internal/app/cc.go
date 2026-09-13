@@ -12,10 +12,12 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -28,6 +30,20 @@ type CCClient struct {
 	BaseURL string
 	Client  *http.Client
 
+	// version supplies x-command-code-version. Atomic because the admin API can
+	// swap it while requests are in flight.
+	version atomic.Pointer[VersionProvider]
+
+	// sessions supplies the gateway's own per-key session IDs (AD-3). Nil
+	// until the detection store is wired in.
+	sessions SessionStore
+
+	// detection holds the persisted fingerprint/session state (AD-3).
+	detection *DetectionStore
+	// handshakeLocks serialize the first-request handshake per account.
+	handshakeMu    sync.Mutex
+	handshakeLocks map[string]*sync.Mutex
+
 	// baseURLMu guards BaseURL, which the admin API can update at runtime.
 	baseURLMu sync.RWMutex
 }
@@ -37,11 +53,39 @@ func NewCCClient(apiKey, baseURL string) *CCClient {
 }
 
 func NewCCClientWithPool(pool *AccountPool, baseURL string) *CCClient {
-	return &CCClient{
+	client := &CCClient{
 		Pool:    pool,
 		BaseURL: baseURL,
-		Client:  &http.Client{Timeout: 600 * time.Second},
+		// No total timeout: the per-request idle watchdogs are the only
+		// binding bound, so a long tool run is not killed by a 600s wall.
+		Client: &http.Client{},
 	}
+	client.version.Store(NewVersionProvider())
+	return client
+}
+
+// SetVersionProvider swaps the CLI version source (tests, admin refresh).
+func (c *CCClient) SetVersionProvider(provider *VersionProvider) {
+	c.version.Store(provider)
+}
+
+// VersionProvider returns the active provider, creating one if the client was
+// constructed without it (zero-value CCClient in tests).
+func (c *CCClient) VersionProvider() *VersionProvider {
+	if p := c.version.Load(); p != nil {
+		return p
+	}
+	p := NewVersionProvider()
+	c.version.Store(p)
+	return p
+}
+
+// cliVersion reports the version to advertise upstream.
+func (c *CCClient) cliVersion() string {
+	if p := c.version.Load(); p != nil {
+		return p.Current()
+	}
+	return fallbackCLIVersion
 }
 
 func (c *CCClient) BaseURLValue() string {
@@ -120,26 +164,48 @@ func normalizeUpstreamError(status int, body []byte, header http.Header) *upstre
 		message = http.StatusText(status)
 	}
 
-	typ, defaultCode := normalizedErrorTypeAndCode(status)
+	// The reference remaps several upstream statuses onto its own vocabulary.
+	mapped := mapUpstreamStatus(status)
+	typ, defaultCode := normalizedErrorTypeAndCode(mapped)
 	if code == "" {
 		code = defaultCode
 	}
 
 	retryAfter := header.Get("Retry-After")
-	if status == http.StatusTooManyRequests && retryAfter == "" {
+	if mapped == http.StatusTooManyRequests && retryAfter == "" {
 		retryAfter = retryAfterFromRateLimit(reset, message, time.Now())
+	}
+	if mapped == http.StatusTooManyRequests && retryAfter == "" {
+		retryAfter = "30"
 	}
 	requestID := header.Get("x-request-id")
 	if requestID == "" {
 		requestID = header.Get("lb-request-id")
 	}
 	return &upstreamAPIError{
-		Status:     status,
+		Status:     mapped,
 		Message:    message,
 		Type:       typ,
 		Code:       code,
 		RetryAfter: retryAfter,
 		RequestID:  requestID,
+	}
+}
+
+// mapUpstreamStatus translates upstream statuses onto the reference's client
+// vocabulary: 402 -> 429, 403 -> 401, 422 -> 400, 500/502 -> 502.
+func mapUpstreamStatus(status int) int {
+	switch status {
+	case http.StatusPaymentRequired:
+		return http.StatusTooManyRequests
+	case http.StatusForbidden:
+		return http.StatusUnauthorized
+	case http.StatusUnprocessableEntity:
+		return http.StatusBadRequest
+	case http.StatusInternalServerError, http.StatusBadGateway:
+		return http.StatusBadGateway
+	default:
+		return status
 	}
 }
 
@@ -150,11 +216,15 @@ func normalizedErrorTypeAndCode(status int) (string, string) {
 	case http.StatusUnauthorized:
 		return "authentication_error", "invalid_api_key"
 	case http.StatusForbidden:
-		return "permission_error", "permission_denied"
+		return "authentication_error", "invalid_api_key"
 	case http.StatusNotFound:
 		return "not_found_error", "not_found"
 	case http.StatusTooManyRequests:
 		return "rate_limit_error", "rate_limit_exceeded"
+	case http.StatusBadGateway:
+		return "upstream_error", "upstream_error"
+	case http.StatusServiceUnavailable:
+		return "temporarily_unavailable", "temporarily_unavailable"
 	default:
 		if status >= http.StatusInternalServerError {
 			return "server_error", "upstream_server_error"
@@ -193,6 +263,12 @@ func retryAfterFromRateLimit(reset float64, message string, now time.Time) strin
 // response is still unwritten — once a stream starts, it is never replayed.
 // The returned Account is the credential that produced the response or error.
 func (c *CCClient) Send(ctx context.Context, req *ChatRequest) (*http.Response, *Account, error) {
+	return c.SendWithHeaders(ctx, req, nil)
+}
+
+// SendWithHeaders is Send plus the inbound client headers, which contribute
+// session-id metadata exactly the way the official CLI does.
+func (c *CCClient) SendWithHeaders(ctx context.Context, req *ChatRequest, inbound http.Header) (*http.Response, *Account, error) {
 	ccReq, err := openAIToCC(req)
 	if err != nil {
 		return nil, nil, err
@@ -223,7 +299,14 @@ func (c *CCClient) Send(ctx context.Context, req *ChatRequest) (*http.Response, 
 			break
 		}
 		lastAcct = acct
-		resp, err := c.doSend(ctx, body, acct.APIKey)
+		if err := c.prepareDetection(ctx, acct); err != nil {
+			if !shouldFailover(err) {
+				return nil, acct, err
+			}
+			lastErr = err
+			continue
+		}
+		resp, err := c.doSend(ctx, body, acct.APIKey, c.newRequestMetadata(inbound, req.PromptCacheKey, c.sessionFor(acct)))
 		if err == nil {
 			acct.RecordSuccess()
 			return resp, acct, nil
@@ -233,7 +316,7 @@ func (c *CCClient) Send(ctx context.Context, req *ChatRequest) (*http.Response, 
 			return nil, acct, err
 		}
 		lastErr = err
-		log.Printf("[WARN] account %s request failed, failing over: %v", acct.Name, err)
+		log.Printf("[WARN] account %s request failed, failing over: %s", acct.Name, redactError(err))
 	}
 	if lastErr != nil {
 		return nil, lastAcct, lastErr
@@ -277,15 +360,13 @@ func shouldFailover(err error) bool {
 	return true
 }
 
-func (c *CCClient) doSend(ctx context.Context, body []byte, apiKey string) (*http.Response, error) {
+func (c *CCClient) doSend(ctx context.Context, body []byte, apiKey string, meta CLIRequestMetadata) (*http.Response, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.BaseURLValue()+"/alpha/generate", bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
+	meta.Apply(httpReq)
 	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
-	httpReq.Header.Set("x-command-code-version", "0.24.1")
-	httpReq.Header.Set("x-cli-environment", "production")
 
 	resp, err := c.Client.Do(httpReq)
 	if err != nil {
@@ -499,6 +580,60 @@ const (
 	maximumCCMaxTokens = 200_000
 )
 
+// cliNodeVersion is the Node runtime reported in config.environment. The
+// upstream expects a Node-based CLI there, so the value mimics Node's naming
+// rather than Go's runtime.GOOS/runtime.GOARCH.
+const cliNodeVersion = "v24.16.0"
+
+// emptySystemPlaceholder replaces an absent system prompt. Without it the
+// upstream injects its own ~7.5k-token default prompt, which pollutes the
+// conversation and the prompt cache. The official CLI always sends a system
+// prompt, so a single space is sent instead of omitting the field. It is a var
+// so callers (tests) can disable the behavior by setting it to "".
+var emptySystemPlaceholder = " "
+
+// cliEnvironment mirrors the official CLI's config.environment, e.g.
+// "win32-x64, Node.js v24.16.0".
+func cliEnvironment() string {
+	return fmt.Sprintf("%s-%s, Node.js %s", nodePlatform(runtime.GOOS), nodeArch(runtime.GOARCH), cliNodeVersion)
+}
+
+// nodePlatform maps Go's GOOS onto the value Node reports as process.platform.
+func nodePlatform(goos string) string {
+	if goos == "windows" {
+		return "win32"
+	}
+	return goos
+}
+
+// nodeArch maps Go's GOARCH onto the value Node reports as process.arch.
+func nodeArch(goarch string) string {
+	switch goarch {
+	case "amd64":
+		return "x64"
+	case "386":
+		return "ia32"
+	}
+	return goarch
+}
+
+// cliWorkingDir reports the process working directory, the same way the
+// official CLI reports its own cwd in config.workingDir.
+func cliWorkingDir() string {
+	dir, err := os.Getwd()
+	if err != nil || dir == "" {
+		return "/"
+	}
+	return dir
+}
+
+// cliConfigDate reports the date the official CLI puts in config.date. The
+// CLI derives it from new Date().toISOString().slice(0, 10), i.e. the UTC
+// calendar date, never the local one.
+func cliConfigDate(now time.Time) string {
+	return now.UTC().Format("2006-01-02")
+}
+
 func openAIToCC(req *ChatRequest) (CCRequest, error) {
 	tools := toolsToCC(req.Tools)
 	msgs, err := messagesToCC(req.Messages)
@@ -506,18 +641,20 @@ func openAIToCC(req *ChatRequest) (CCRequest, error) {
 		return CCRequest{}, err
 	}
 	system := extractSystem(req.Messages)
+	if system == "" {
+		system = emptySystemPlaceholder
+	}
 
+	// memory and taste stay nil (null on the wire) and skills stays "" — those
+	// exact values are what the official CLI sends (see CCRequest).
 	cc := CCRequest{
 		Config: CCConfig{
-			WorkingDir:    "/",
-			Date:          time.Now().Format("2006-01-02"),
-			Environment:   fmt.Sprintf("%s-%s, Go proxy", runtime.GOOS, runtime.GOARCH),
+			WorkingDir:    cliWorkingDir(),
+			Date:          cliConfigDate(time.Now()),
+			Environment:   cliEnvironment(),
 			Structure:     []string{},
 			RecentCommits: []any{},
 		},
-		Memory:         "",
-		Taste:          "",
-		Skills:         nil,
 		PermissionMode: "standard",
 		Params: CCParams{
 			Model:     resolveModelName(req.Model),
@@ -537,7 +674,94 @@ func openAIToCC(req *ChatRequest) (CCRequest, error) {
 	if cc.Params.MaxTokens > maximumCCMaxTokens {
 		cc.Params.MaxTokens = maximumCCMaxTokens
 	}
+
+	// Sampling/reasoning parameters pass through the way the reference does:
+	// forward whatever the client set, and only warn about unexpected values
+	// instead of dropping them.
+	cc.Params.Temperature = req.Temperature
+	cc.Params.ParallelToolCalls = req.ParallelToolCalls
+	cc.Params.ReasoningEffort = req.ReasoningEffort
+	if req.ReasoningEffort != "" && !knownReasoningEfforts[req.ReasoningEffort] {
+		// The reference forwards any value; surface the mismatch without
+		// changing what goes on the wire.
+		log.Printf("[WARN] unexpected reasoning_effort %q, forwarding unchanged", req.ReasoningEffort)
+	}
+	toolChoice, err := toolChoiceToCC(req.ToolChoice)
+	if err != nil {
+		return CCRequest{}, err
+	}
+	cc.Params.ToolChoice = toolChoice
+	applyPromptCacheMarker(cc.Params.Messages, req.PromptCacheKey)
 	return cc, nil
+}
+
+// knownReasoningEfforts is advisory only: unknown values are still forwarded
+// (the reference does the same), we just make the mismatch visible in logs.
+var knownReasoningEfforts = map[string]bool{"low": true, "medium": true, "high": true, "max": true}
+
+// toolChoiceToCC maps OpenAI's tool_choice onto the upstream shape. Unknown
+// strings are ignored; structurally invalid values are client errors.
+func toolChoiceToCC(raw json.RawMessage) (*CCToolChoice, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return nil, nil
+	}
+	switch trimmed[0] {
+	case '"':
+		var mode string
+		if err := json.Unmarshal(trimmed, &mode); err != nil {
+			return nil, &invalidRequestError{message: fmt.Sprintf("invalid tool_choice: %v", err)}
+		}
+		switch mode {
+		case "auto":
+			return &CCToolChoice{Type: "auto"}, nil
+		case "none":
+			return &CCToolChoice{Type: "none"}, nil
+		case "required":
+			return &CCToolChoice{Type: "any"}, nil
+		default:
+			return nil, nil
+		}
+	case '{':
+		var payload struct {
+			Type     string `json:"type"`
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		}
+		if err := json.Unmarshal(trimmed, &payload); err != nil {
+			return nil, &invalidRequestError{message: fmt.Sprintf("invalid tool_choice: %v", err)}
+		}
+		if payload.Type == "function" && payload.Function.Name != "" {
+			return &CCToolChoice{Type: "tool", Name: payload.Function.Name}, nil
+		}
+		return nil, nil
+	default:
+		return nil, &invalidRequestError{message: "tool_choice must be a string or an object"}
+	}
+}
+
+// applyPromptCacheMarker adds an ephemeral cache breakpoint to the last text
+// part of the first user message, matching the reference's handling of
+// prompt_cache_key. An existing marker is never replaced.
+func applyPromptCacheMarker(msgs []CCMsg, key string) {
+	if key == "" {
+		return
+	}
+	for i := range msgs {
+		if msgs[i].Role != "user" {
+			continue
+		}
+		for j := len(msgs[i].Content) - 1; j >= 0; j-- {
+			if msgs[i].Content[j].Type == "text" {
+				if msgs[i].Content[j].CacheControl == nil {
+					msgs[i].Content[j].CacheControl = &CacheControl{Type: "ephemeral"}
+				}
+				return
+			}
+		}
+		return
+	}
 }
 
 func extractSystem(msgs []Message) string {

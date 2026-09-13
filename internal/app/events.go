@@ -39,6 +39,10 @@ type ccEventNormalizer struct {
 	cacheWrite     int
 	finished       bool
 	truncated      bool
+	// usageSeen distinguishes "upstream reported zero output tokens" from
+	// "upstream reported no usage at all". Only the former is a zero-output
+	// response; the latter must not be turned into an error.
+	usageSeen bool
 }
 
 func newCCEventNormalizer() *ccEventNormalizer {
@@ -107,6 +111,9 @@ func (n *ccEventNormalizer) Consume(ev CCStreamEvent) ([]normalizedCCEvent, erro
 		}
 		if ev.TotalUsage != nil {
 			n.setUsage(ev.TotalUsage)
+		} else if ev.Usage != nil {
+			// Some upstreams report usage on the finish event itself.
+			n.setUsage(ev.Usage)
 		}
 		// A buffered input without a structured end event is incomplete. Drop it
 		// rather than guessing where its JSON or business content should end.
@@ -157,7 +164,11 @@ func (n *ccEventNormalizer) FinalUsageInfo() Usage {
 	return n.usage
 }
 
+// UsageSeen reports whether the upstream supplied usage for this response.
+func (n *ccEventNormalizer) UsageSeen() bool { return n.usageSeen }
+
 func (n *ccEventNormalizer) setUsage(usage *CCUsage) {
+	n.usageSeen = true
 	n.usage.PromptTokens = usage.InputTokens
 	n.usage.CompletionTokens = usage.OutputTokens
 	if usage.TotalTokens > 0 {

@@ -74,7 +74,7 @@
   td { padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top; font-size: 13px; }
   tr:last-child td { border-bottom: none; }
   td.num { font-family: var(--mono); font-size: 12.5px; }
-  .row-actions { display: flex; gap: 6px; justify-content: flex-end; }
+  .row-actions { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
 
   .badge {
     display: inline-block; padding: 2px 9px; border-radius: 20px;
@@ -230,6 +230,11 @@
   /* each account's main row and its quota/usage detail read as one block */
   tbody.acc-group tr > td { border-bottom: none; }
   tbody.acc-group + tbody.acc-group tr:first-child > td { border-top: 1px solid var(--border); }
+
+  /* wide tables scroll inside their panel instead of stretching past it */
+  #acc-table, #ck-table { overflow-x: auto; }
+  #acc-table table { min-width: 1000px; }
+
 </style>
 </head>
 <body>

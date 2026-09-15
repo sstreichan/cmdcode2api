@@ -272,7 +272,7 @@ func TestAdminCLIVersionEndpoints(t *testing.T) {
 	cc := NewCCClientWithPool(NewAccountPool(nil), "https://api.commandcode.test")
 	cc.SetVersionProvider(provider)
 	mux := http.NewServeMux()
-	registerAdminRoutes(mux, cc, NewAccountPool(nil), NewClientKeyPool(nil), &Config{}, &UsageTracker{}, newLogRing())
+  registerAdminRoutes(mux, cc, NewAccountPool(nil), NewClientKeyPool(nil), &Config{}, &UsageTracker{}, newLogRing(), nil)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 

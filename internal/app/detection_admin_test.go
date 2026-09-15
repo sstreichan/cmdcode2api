@@ -25,7 +25,7 @@ func newDetectionAdminEnv(t *testing.T) (*httptest.Server, *AccountPool, *CCClie
 	}
 
 	mux := http.NewServeMux()
-	registerAdminRoutes(mux, cc, pool, NewClientKeyPool(nil), &Config{}, &UsageTracker{}, newLogRing())
+	registerAdminRoutes(mux, cc, pool, NewClientKeyPool(nil), &Config{}, &UsageTracker{}, newLogRing(), nil)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv, pool, cc, recorder

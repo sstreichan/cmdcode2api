@@ -188,7 +188,7 @@ func (h *gatewayHost) start(accounts []AccountConfig) *integrationGateway {
 		_ = json.NewEncoder(w).Encode(usage.Snapshot())
 	})
 	adminMux := http.NewServeMux()
-	registerAdminRoutes(adminMux, cc, pool, keys, cfg, usage, newLogRing())
+	registerAdminRoutes(adminMux, cc, pool, keys, cfg, usage, newLogRing(), nil)
 	mux.Handle("/admin/", adminAuth(cfg, nil)(adminMux))
 	mux.HandleFunc("POST /admin/api/oauth/callback", handleWebOAuthCallback())
 

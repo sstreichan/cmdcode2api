@@ -23,6 +23,14 @@ type ChatRequest struct {
 	MaxCompletionTokens int            `json:"max_completion_tokens,omitempty"`
 	Tools               []Tool         `json:"tools,omitempty"`
 	StreamOptions       *StreamOptions `json:"stream_options,omitempty"`
+
+	// Parameters the official CLI forwards to the upstream. Pointers keep
+	// "absent" distinguishable from zero values (temperature 0, false).
+	Temperature       *float64        `json:"temperature,omitempty"`
+	ToolChoice        json.RawMessage `json:"tool_choice,omitempty"`
+	ParallelToolCalls *bool           `json:"parallel_tool_calls,omitempty"`
+	ReasoningEffort   string          `json:"reasoning_effort,omitempty"`
+	PromptCacheKey    string          `json:"prompt_cache_key,omitempty"`
 }
 
 type StreamOptions struct {
@@ -264,11 +272,14 @@ type CCProviderModelList struct {
 // Command Code 内部格式（我们 ↔ CC 服务器）
 // ============================================================================
 
+// CCRequest is the CLI-compatible envelope sent to the Command Code API.
+// The wire values mirror the official CLI exactly: memory and taste are null
+// (hence the pointers) and skills is an empty string, not an empty array.
 type CCRequest struct {
 	Config         CCConfig `json:"config"`
-	Memory         string   `json:"memory"`
-	Taste          string   `json:"taste"`
-	Skills         any      `json:"skills"`
+	Memory         *string  `json:"memory"`
+	Taste          *string  `json:"taste"`
+	Skills         string   `json:"skills"`
 	PermissionMode string   `json:"permissionMode"`
 	Params         CCParams `json:"params"`
 }
@@ -292,6 +303,19 @@ type CCParams struct {
 	System    string   `json:"system,omitempty"`
 	MaxTokens int      `json:"max_tokens"`
 	Stream    bool     `json:"stream"`
+
+	// Forwarded verbatim from the client, matching the reference proxy.
+	Temperature       *float64      `json:"temperature,omitempty"`
+	ToolChoice        *CCToolChoice `json:"tool_choice,omitempty"`
+	ParallelToolCalls *bool         `json:"parallel_tool_calls,omitempty"`
+	ReasoningEffort   string        `json:"reasoning_effort,omitempty"`
+}
+
+// CCToolChoice is the upstream shape of OpenAI's tool_choice: a plain mode or
+// a pinned tool. OpenAI's "required" maps to the upstream's "any".
+type CCToolChoice struct {
+	Type string `json:"type"`
+	Name string `json:"name,omitempty"`
 }
 
 type CCMsg struct {
@@ -300,13 +324,21 @@ type CCMsg struct {
 }
 
 type CCPart struct {
-	Type       string          `json:"type"`
-	Text       string          `json:"text,omitempty"`
-	Source     map[string]any  `json:"source,omitempty"`
-	ToolCallID string          `json:"toolCallId,omitempty"`
-	ToolName   string          `json:"toolName,omitempty"`
-	Input      json.RawMessage `json:"input,omitempty"`
-	Output     *CCOutput       `json:"output,omitempty"`
+	Type         string          `json:"type"`
+	Text         string          `json:"text,omitempty"`
+	Source       map[string]any  `json:"source,omitempty"`
+	ToolCallID   string          `json:"toolCallId,omitempty"`
+	ToolName     string          `json:"toolName,omitempty"`
+	Input        json.RawMessage `json:"input,omitempty"`
+	Output       *CCOutput       `json:"output,omitempty"`
+	CacheControl *CacheControl   `json:"cache_control,omitempty"`
+}
+
+// CacheControl marks a prompt-cache breakpoint. The reference adds an
+// ephemeral marker to the last text part of the first user message whenever
+// the client supplies a prompt_cache_key.
+type CacheControl struct {
+	Type string `json:"type"`
 }
 
 type CCOutput struct {

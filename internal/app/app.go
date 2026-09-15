@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -156,6 +157,13 @@ Use the local client key above as the Bearer token for your OpenAI client.
 
 	pool := NewAccountPool(cfg.CommandCode.Accounts)
 	cc := NewCCClientWithPool(pool, cfg.UpstreamBaseURL())
+	// Resolve the CLI version once at startup and every 24h. Completions only
+	// read the cached value, so this never adds a request per completion.
+	cc.VersionProvider().Start(context.Background())
+	// Per-key fingerprint/session state, persisted next to config.yaml.
+	detection := loadDetection(detectionFile)
+	pool.SetDetectionStore(detection)
+	cc.SetDetection(detection)
 	usage := loadUsage()
 
 	if primary := pool.Primary(); primary != nil {

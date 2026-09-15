@@ -19,8 +19,11 @@ The project was originally named `cc-gateway`; it was renamed to avoid confusion
 - Browser OAuth helper for obtaining a Command Code API key (CLI or from the WebUI); each OAuth run adds an account
 - Local bearer-token auth for clients and a separate admin password for the WebUI
 - CORS enabled for local UI clients
-- Usage counters (global, per-account, and per-client-key) and cached quota snapshots persisted to `usage.json`
-- Command Code quota dashboard: 5-hour rolling / weekly / estimated monthly progress bars, credit balances, plan and billing period, refreshed in the background every 5 minutes
+ - Usage counters (global, per-account, and per-client-key) and cached quota snapshots persisted to `usage.json`
+ - CLI-compatible request metadata: version resolved from the npm registry, session id, `x-project-slug`, W3C `traceparent`, and optional ZDR (`x-cmd-zdr`)
+ - Command Code quota dashboard: 5-hour rolling / weekly / estimated monthly progress bars, credit balances, plan and billing period, refreshed in the background every 5 minutes
+ - Per-account device fingerprint + lifecycle handshake and a rotating per-key session, persisted in `detection.json`
+ - Gateway hardening: per-chunk idle watchdogs, a strict zero-output guard, a 100 MB request cap, and an optional in-flight cap
 - Health endpoint: `GET /health`
 - Usage endpoint: `GET /usage`
 
@@ -33,8 +36,8 @@ go build -o cmdcode2api ./cmd/cmdcode2api
 ## Docker
 
 Prebuilt multi-arch images are published to GHCR by CI on every master push
-(`latest`) and every `v*` tag. `config.yaml` and `usage.json` live in the
-`/data` volume, so bind-mount or name a volume for them:
+(`latest`) and every `v*` tag. `config.yaml`, `usage.json`, and `detection.json`
+live in the `/data` volume, so bind-mount or name a volume for them:
 
 ```bash
 docker run -d --name cmdcode2api -p 11434:11434 -v cmdcode2api-data:/data ghcr.io/peach0x33a/cmdcode2api:latest
@@ -205,6 +208,34 @@ retried with the next account automatically:
 - Per-account request/token counters persist in `usage.json`; error state,
   last error, and cooldown windows are runtime-only and visible in the WebUI.
 
+### Detection state (CLI simulation)
+
+To look like the official CLI to the upstream, each account gets its own device
+fingerprint and session:
+
+- On the first request per key — and again after the refresh window — the
+gateway records a fingerprint (`POST /alpha/fingerprint/record`) and a
+lifecycle event (`POST /alpha/lifecycle-events`) in parallel, then sends the
+completion. A handshake failure never blocks the completion; only a `401`/`403`
+disables the account.
+- A per-key session id is reused for `x-session-id` (the client's own
+`x-session-id`/`x-claude-code-session-id`/`session_id`/`prompt_cache_key` wins
+when present). It rotates every 12h plus up to 1h of jitter; a rotated session
+triggers a fresh fingerprint too.
+- State is keyed by the account's hashed id in `detection.json` next to
+`config.yaml`, so it survives restarts without ever storing the raw key.
+Changing an account's key discards its state — a profile shared across keys
+would make the accounts linkable upstream — while renaming keeps it.
+- A missing `detection.json` is a normal first start; a corrupt one is rebuilt
+with a `[WARN]`.
+- The WebUI Accounts tab shows a shortened fingerprint, the device profile, the
+next refresh, and session expiry, and offers **re-record** (one new fingerprint
+call) and **new session** (one new lifecycle call).
+
+`detection.json` is runtime state, not configuration: it is not part of
+`config.yaml`, needs no migration, and deleting it simply triggers a fresh
+recording.
+
 ## Run
 
 ```bash
@@ -337,6 +368,14 @@ Supported request styles:
 Remote HTTP(S) image URLs are rejected with `400 invalid_request_error`; image
 content must be supplied as a base64 `data:image/...;base64,...` URL.
 
+Clients can authenticate with `Authorization: Bearer <local-api-key>` or
+`x-api-key: <local-api-key>`. A response the upstream finishes with zero
+output tokens is reported as `429 rate_limit_error` with `Retry-After: 10`
+rather than an empty `200`, and request bodies over 100 MB are rejected with
+`413`. Upstream statuses are normalized too: `402` → `429`,
+`403` → `401` (`authentication_error`), `422` → `400`, `500`/`502` → `502`
+(`upstream_error`), `503` → `503` (`temporarily_unavailable`).
+
 ## WebUI
 
 With `webui` enabled (the default), the binary serves an embedded
@@ -353,11 +392,11 @@ pointed at any running instance.
 
 Features:
 
-- **Overview** — version, uptime, listen address, usage counters, account/key/model summaries, and a quota sync summary (synced / exceeded / low-balance accounts, last refresh)
-- **Accounts** — add (paste a key or run OAuth with an optional callback URL), edit name/key, enable/disable, connectivity test, quota refresh, delete; per-account requests, tokens, errors, cooldown state, last error, and quota (5-hour / weekly / estimated monthly bars, balances, plan, billing period). OAuth-added accounts are named after the Command Code user automatically
+ - **Overview** — version, uptime, listen address, usage counters, account/key/model summaries, and a quota sync summary (synced / exceeded / low-balance accounts, last refresh)
+ - **Accounts** — add (paste a key or run OAuth with an optional callback URL), edit name/key, enable/disable, connectivity test, quota refresh, delete; per-account requests, tokens, errors, cooldown state, last error, and quota (5-hour / weekly / estimated monthly bars, balances, plan, billing period). OAuth-added accounts are named after the Command Code user automatically. The fingerprint/session column shows the shortened device fingerprint with its next refresh and session expiry, plus **re-record** and **new session** actions
 - **Models** — checkbox list of upstream models; checked = exposed via `/v1/models` and callable, unchecked = hidden. This is the editor for `exclude_models` and applies live
 - **Keys** — create local client API keys (always server-generated), enable/disable, copy, delete; per-key request and token usage. Keys are masked in the list — reveal or copy them on demand (the full value is shown once at creation)
-- **Settings** — edit `base_url` (live), `host`/`port`/`webui` (persisted, applied on restart), and change the admin password (requires the current password; every existing admin session is kicked afterwards)
+- **Settings** — edit `base_url` (live), `host`/`port`/`webui` (persisted, applied on restart), inspect the advertised CLI version (resolved from npm, with a manual refresh), and change the admin password (requires the current password; every existing admin session is kicked afterwards)
 - **Logs** — tail of the in-memory log ring (last 500 lines)
 
 Changes to accounts and settings are written back to `config.yaml` immediately.
@@ -399,8 +438,11 @@ POST   /admin/api/accounts             {"name": "...", "api_key": "..."}
 PATCH  /admin/api/accounts/{id}        {"enabled": true}, {"name": "..."} or {"api_key": "..."}
 DELETE /admin/api/accounts/{id}
 POST   /admin/api/accounts/{id}/test
+POST   /admin/api/accounts/{id}/fingerprint   re-record the device fingerprint
+POST   /admin/api/accounts/{id}/session       rotate the per-key session
 POST   /admin/api/accounts/{id}/quota/refresh
 POST   /admin/api/quotas/refresh       {"id": "..."} optional — omit to refresh every account
+GET    /admin/api/detection
 GET    /admin/api/models
 PUT    /admin/api/models               {"exposed": ["model-id", ...]}
 GET    /admin/api/keys
@@ -410,6 +452,8 @@ PATCH  /admin/api/keys/{id}            {"enabled": true} or {"name": "..."}
 DELETE /admin/api/keys/{id}
 GET    /admin/api/settings
 PUT    /admin/api/settings
+GET    /admin/api/cliversion
+POST   /admin/api/cliversion/refresh
 GET    /admin/api/logs?after=SEQ
 POST   /admin/api/oauth/start
 GET    /admin/api/oauth/status
@@ -438,6 +482,20 @@ Command Code page then posts the credential there; the transfer is protected
 by a single-use state token. The CLI `--oauth` mode and an SSH tunnel remain
 alternatives.
 
+## Environment variables
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CC_STREAM_IDLE_MS` | `30000` | Streaming idle watchdog, reset on every upstream chunk (including `:` keepalive lines). On expiry: `429 rate_limit_error` with `Retry-After: 5` before the first frame, otherwise an SSE error frame and the connection is closed without `[DONE]`. Set to `0` to disable. |
+| `CC_NONSTREAM_IDLE_MS` | `90000` | The same idle watchdog for `stream: false`. |
+| `CC_MAX_INFLIGHT` | `0` (off) | Maximum concurrent chat requests; over the limit returns `503 server_busy` with `Retry-After: 5`. `/health` is never counted or rejected. |
+| `CC_CLIENT_DRAIN_TIMEOUT_MS` | `0` (off) | Optional write deadline for a stalled downstream reader. Off by default: a client blocked on tool execution looks the same as a stalled one. |
+| `CMD_ZDR` | unset | Set to `1`/`true` to send `x-cmd-zdr: 1` (zero-data-retention routing) on completions and handshakes. A request can also opt in per call with `x-cmd-zdr: 1`. |
+
+The idle watchdogs are idle timeouts, not total budgets: a slow-but-steady
+stream never trips one. After three consecutive timeouts the error message adds
+the hint to reduce the context length.
+
 ## Files intentionally not committed
 
 The repository ignores runtime/secrets artifacts:
@@ -447,6 +505,7 @@ cmdcode2api
 cc-gateway
 config.yaml
 usage.json
+detection.json
 *.exe
 .oauth_state
 .oauth_url

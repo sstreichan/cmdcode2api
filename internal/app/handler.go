@@ -12,13 +12,15 @@ import (
 	"time"
 )
 
-const maxChatRequestBytes = 50 * 1024 * 1024
-
 var debugMode bool
+
+// errZeroOutputHandled stops the stream callback once the zero-output guard
+// has already produced its response (or error frame).
+var errZeroOutputHandled = errors.New("zero-output guard handled")
 
 func handleChatCompletions(cc *CCClient, cfg *Config, usage *UsageTracker) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		r.Body = http.MaxBytesReader(w, r.Body, maxChatRequestBytes)
+		r.Body = http.MaxBytesReader(w, r.Body, int64(maxChatRequestBytes))
 
 		var req ChatRequest
 		if cfg.Debug {
@@ -27,10 +29,18 @@ func handleChatCompletions(cc *CCClient, cfg *Config, usage *UsageTracker) http.
 				writeError(w, 400, "invalid_request_error", "bad request body: "+err.Error())
 				return
 			}
-			log.Printf("%s %s %s", colorize("[DEBUG]", ansiDim), colorize(">> body", ansiGreen), colorize(string(bodyBytes), ansiCyan))
+			log.Printf("%s %s %s", colorize("[DEBUG]", ansiDim), colorize(">> body", ansiGreen), colorize(redactJSONBody(bodyBytes), ansiCyan))
 			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				// Close rather than reuse: the unread remainder cannot be drained
+				// once MaxBytesReader has stopped reading.
+				w.Header().Set("Connection", "close")
+				writeError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body too large")
+				return
+			}
 			writeError(w, 400, "invalid_request_error", "bad request body: "+err.Error())
 			return
 		}
@@ -48,7 +58,7 @@ func handleChatCompletions(cc *CCClient, cfg *Config, usage *UsageTracker) http.
 			return
 		}
 
-		resp, acct, err := cc.Send(r.Context(), &req)
+		resp, acct, err := cc.SendWithHeaders(r.Context(), &req, r.Header)
 		if err != nil {
 			var invalid *invalidRequestError
 			if errors.As(err, &invalid) {
@@ -57,7 +67,9 @@ func handleChatCompletions(cc *CCClient, cfg *Config, usage *UsageTracker) http.
 			}
 			var upstreamErr *upstreamAPIError
 			if errors.As(err, &upstreamErr) {
-				log.Printf("%s cc request failed: %v", colorize("[ERROR]", ansiRed), upstreamErr)
+				log.Printf("%s cc request failed: status=%d type=%s code=%s message=%s",
+					colorize("[ERROR]", ansiRed), upstreamErr.Status, upstreamErr.Type, upstreamErr.Code,
+					redactText(upstreamErr.Message))
 				if upstreamErr.RetryAfter != "" {
 					w.Header().Set("Retry-After", upstreamErr.RetryAfter)
 				}
@@ -67,16 +79,16 @@ func handleChatCompletions(cc *CCClient, cfg *Config, usage *UsageTracker) http.
 				writeErrorWithCode(w, upstreamErr.Status, upstreamErr.Type, upstreamErr.Code, upstreamErr.Message)
 				return
 			}
-			log.Printf("%s cc request failed: %v", colorize("[ERROR]", ansiRed), err)
-			writeError(w, http.StatusBadGateway, "server_error", "upstream error: "+err.Error())
+			log.Printf("%s cc request failed: %s", colorize("[ERROR]", ansiRed), redactError(err))
+			writeError(w, http.StatusBadGateway, "server_error", "upstream error: "+redactText(err.Error()))
 			return
 		}
 
 		if req.Stream {
 			includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
-			handleStreamWithOptions(w, resp, req.Model, usage.RecorderFor(acct, clientKeyIDFrom(r.Context())), cfg, includeUsage)
+			handleStreamWithAccount(w, resp, req.Model, usage.RecorderFor(acct, clientKeyIDFrom(r.Context())), cfg, includeUsage, acct)
 		} else {
-			handleNonStream(w, resp, req.Model, usage.RecorderFor(acct, clientKeyIDFrom(r.Context())), cfg)
+			handleNonStreamWithAccount(w, resp, req.Model, usage.RecorderFor(acct, clientKeyIDFrom(r.Context())), cfg, acct)
 		}
 		if err := usage.save(); err != nil {
 			log.Printf("%s save usage failed: %v", colorize("[ERROR]", ansiRed), err)
@@ -89,10 +101,17 @@ func handleStream(w http.ResponseWriter, resp *http.Response, model string, usag
 }
 
 func handleStreamWithOptions(w http.ResponseWriter, resp *http.Response, model string, usage usageRecorder, cfg *Config, includeUsage bool) {
+	handleStreamWithAccount(w, resp, model, usage, cfg, includeUsage, nil)
+}
+
+func handleStreamWithAccount(w http.ResponseWriter, resp *http.Response, model string, usage usageRecorder, cfg *Config, includeUsage bool, account *Account) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, 500, "server_error", "streaming not supported")
 		return
+	}
+	if streamIdleTimeout > 0 && resp.Body != nil {
+		resp.Body = newIdleBody(resp.Body, streamIdleTimeout)
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -102,8 +121,15 @@ func handleStreamWithOptions(w http.ResponseWriter, resp *http.Response, model s
 	streamID := genStreamID()
 	created := time.Now().Unix()
 	firstText := true
-	var done bool      // [DONE] has been written; nothing more may be emitted
-	var finishing bool // finishStream is running its final flush
+	var done bool          // [DONE] has been written; nothing more may be emitted
+	var finishing bool     // finishStream is running its final flush
+	var wroteAny bool      // any SSE frame has been flushed (response committed)
+	var zeroOutput429 bool // guard fired before the first frame, so a real 429 is possible
+
+	writeChunk := func(chunk ChatStreamChunk) {
+		wroteAny = true
+		writeSSE(w, flusher, chunk)
+	}
 
 	normalizer := newCCEventNormalizer()
 	var collectedToolCalls toolCallDeduper
@@ -125,7 +151,7 @@ func handleStreamWithOptions(w http.ResponseWriter, resp *http.Response, model s
 			delta.Role = "assistant"
 			firstText = false
 		}
-		writeSSE(w, flusher, ChatStreamChunk{
+		writeChunk(ChatStreamChunk{
 			ID:      streamID,
 			Object:  "chat.completion.chunk",
 			Created: created,
@@ -158,7 +184,7 @@ func handleStreamWithOptions(w http.ResponseWriter, resp *http.Response, model s
 				delta.Role = "assistant"
 				firstText = false
 			}
-			writeSSE(w, flusher, ChatStreamChunk{
+			writeChunk(ChatStreamChunk{
 				ID:      streamID,
 				Object:  "chat.completion.chunk",
 				Created: created,
@@ -182,7 +208,7 @@ func handleStreamWithOptions(w http.ResponseWriter, resp *http.Response, model s
 		}
 		emitCollectedToolCalls()
 		finish := resolveFinishReason(reason, hasToolCalls, truncated)
-		writeSSE(w, flusher, ChatStreamChunk{
+		writeChunk(ChatStreamChunk{
 			ID:      streamID,
 			Object:  "chat.completion.chunk",
 			Created: created,
@@ -194,7 +220,7 @@ func handleStreamWithOptions(w http.ResponseWriter, resp *http.Response, model s
 			}},
 		})
 		if includeUsage {
-			writeSSE(w, flusher, ChatStreamChunk{
+			writeChunk(ChatStreamChunk{
 				ID:      streamID,
 				Object:  "chat.completion.chunk",
 				Created: created,
@@ -225,10 +251,20 @@ func handleStreamWithOptions(w http.ResponseWriter, resp *http.Response, model s
 		flusher.Flush()
 	}
 
+	// failStreamNoDone emits an error frame and closes the connection without
+	// [DONE], matching the reference for a timeout after the first frame.
+	failStreamNoDone := func(code, message string) {
+		if done {
+			return
+		}
+		writeSSEError(w, flusher, code, message)
+		done = true
+		flusher.Flush()
+	}
+
 	endKind, err := parseStreamEvents(resp, func(ev CCStreamEvent) error {
 		if cfg.Debug {
-			raw, _ := json.Marshal(ev)
-			log.Printf("%s %s event type=%s raw=%s", colorize("[DEBUG]", ansiDim), colorize("<< cc", ansiCyan), ev.Type, colorize(string(raw), ansiCyan))
+			log.Printf("%s %s event type=%s", colorize("[DEBUG]", ansiDim), colorize("<< cc", ansiCyan), ev.Type)
 		}
 		events, err := normalizer.Consume(ev)
 		if err != nil {
@@ -250,6 +286,16 @@ func handleStreamWithOptions(w http.ResponseWriter, resp *http.Response, model s
 				// End markers carry no content; text and reasoning deltas are
 				// forwarded immediately and are never interpreted as tool syntax.
 			case normalizedFinish:
+				if normalizer.UsageSeen() && event.usage.CompletionTokens == 0 {
+					// Strict zero-output guard, matching the reference: always an
+					// error, never a 200 with an empty completion.
+					if !wroteAny {
+						zeroOutput429 = true
+						return errZeroOutputHandled
+					}
+					failStream("zero_output", "Empty response from upstream (zero output tokens)")
+					return errZeroOutputHandled
+				}
 				if err := finishStream(event.finishReason, event.usage, event.truncated); err != nil {
 					return err
 				}
@@ -258,16 +304,41 @@ func handleStreamWithOptions(w http.ResponseWriter, resp *http.Response, model s
 		return nil
 	})
 
+	if errors.Is(err, errZeroOutputHandled) {
+		promptTokens, completionTokens, cacheRead, cacheWrite := normalizer.Usage()
+		if zeroOutput429 {
+			w.Header().Set("Retry-After", "10")
+			writeError(w, http.StatusTooManyRequests, "rate_limit_error", "Empty response from upstream (zero output tokens)")
+		}
+		recordPartialUsage(usage, promptTokens, completionTokens, cacheRead, cacheWrite)
+		logZeroOutputFailure(account)
+		return
+	}
+
 	if err != nil {
-		log.Printf("%s stream parse failed: %v", colorize("[ERROR]", ansiRed), err)
+		if isIdleTimeout(err) {
+			recordTimeout()
+			message := timeoutErrorMessage()
+			if !wroteAny {
+				// Nothing has been flushed yet, so a real 429 is still possible.
+				w.Header().Set("Retry-After", "5")
+				writeError(w, http.StatusTooManyRequests, "rate_limit_error", message)
+			} else {
+				failStreamNoDone("upstream_timeout", message)
+			}
+			return
+		}
+		log.Printf("%s stream parse failed: %s", colorize("[ERROR]", ansiRed), redactError(err))
 		failStream("upstream_stream_error", "upstream stream error: "+err.Error())
 	} else if !done {
 		message := "upstream connection closed before a finish event"
 		if endKind == streamEndDone {
 			message = "upstream sent [DONE] before a finish event"
 		}
-		log.Printf("%s %s", colorize("[ERROR]", ansiRed), message)
+		log.Printf("%s %s", colorize("[ERROR]", ansiRed), redactText(message))
 		failStream("upstream_stream_incomplete", message)
+	} else {
+		resetTimeoutCounter()
 	}
 
 	promptTokens, completionTokens, cacheRead, cacheWrite := normalizer.Usage()
@@ -275,6 +346,13 @@ func handleStreamWithOptions(w http.ResponseWriter, resp *http.Response, model s
 }
 
 func handleNonStream(w http.ResponseWriter, resp *http.Response, model string, usage usageRecorder, cfg *Config) {
+	handleNonStreamWithAccount(w, resp, model, usage, cfg, nil)
+}
+
+func handleNonStreamWithAccount(w http.ResponseWriter, resp *http.Response, model string, usage usageRecorder, cfg *Config, account *Account) {
+	if nonStreamIdleTimeout > 0 && resp.Body != nil {
+		resp.Body = newIdleBody(resp.Body, nonStreamIdleTimeout)
+	}
 	msg := Message{Role: "assistant"}
 	var toolCalls toolCallDeduper
 	normalizer := newCCEventNormalizer()
@@ -292,8 +370,7 @@ func handleNonStream(w http.ResponseWriter, resp *http.Response, model string, u
 
 	endKind, err := parseStreamEvents(resp, func(ev CCStreamEvent) error {
 		if cfg.Debug {
-			raw, _ := json.Marshal(ev)
-			log.Printf("%s %s event type=%s raw=%s", colorize("[DEBUG]", ansiDim), colorize("<< cc", ansiCyan), ev.Type, colorize(string(raw), ansiCyan))
+			log.Printf("%s %s event type=%s", colorize("[DEBUG]", ansiDim), colorize("<< cc", ansiCyan), ev.Type)
 		}
 		events, err := normalizer.Consume(ev)
 		if err != nil {
@@ -320,7 +397,13 @@ func handleNonStream(w http.ResponseWriter, resp *http.Response, model string, u
 	})
 
 	if err != nil {
-		log.Printf("%s non-stream parse failed: %v", colorize("[ERROR]", ansiRed), err)
+		if isIdleTimeout(err) {
+			recordTimeout()
+			w.Header().Set("Retry-After", "5")
+			writeError(w, http.StatusTooManyRequests, "rate_limit_error", timeoutErrorMessage())
+			return
+		}
+		log.Printf("%s non-stream parse failed: %s", colorize("[ERROR]", ansiRed), redactError(err))
 		writeErrorWithCode(w, http.StatusBadGateway, "server_error", "upstream_stream_error", "upstream stream error: "+err.Error())
 		return
 	}
@@ -329,7 +412,7 @@ func handleNonStream(w http.ResponseWriter, resp *http.Response, model string, u
 		if endKind == streamEndDone {
 			message = "upstream sent [DONE] before a finish event"
 		}
-		log.Printf("%s %s", colorize("[ERROR]", ansiRed), message)
+		log.Printf("%s %s", colorize("[ERROR]", ansiRed), redactText(message))
 		writeErrorWithCode(w, http.StatusBadGateway, "server_error", "upstream_stream_incomplete", message)
 		return
 	}
@@ -348,7 +431,16 @@ func handleNonStream(w http.ResponseWriter, resp *http.Response, model string, u
 		msg.ReasoningContent = reasoningText
 	}
 	promptTokens, completionTokens, cacheRead, cacheWrite := normalizer.FinalUsage()
+	if normalizer.UsageSeen() && completionTokens == 0 {
+		// Strict zero-output guard: never deliver an empty 200 completion.
+		w.Header().Set("Retry-After", "10")
+		writeError(w, http.StatusTooManyRequests, "rate_limit_error", "Empty response from upstream (zero output tokens)")
+		recordPartialUsage(usage, promptTokens, completionTokens, cacheRead, cacheWrite)
+		logZeroOutputFailure(account)
+		return
+	}
 	usage.Record(promptTokens, completionTokens, cacheRead, cacheWrite)
+	resetTimeoutCounter()
 
 	res := ChatResponse{
 		ID:      genStreamID(),
@@ -365,7 +457,7 @@ func handleNonStream(w http.ResponseWriter, resp *http.Response, model string, u
 
 	if cfg.Debug {
 		raw, _ := json.Marshal(res)
-		log.Printf("%s %s %s", colorize("[DEBUG]", ansiDim), colorize(">> response", ansiGreen), colorize(string(raw), ansiCyan))
+		log.Printf("%s %s %s", colorize("[DEBUG]", ansiDim), colorize(">> response", ansiGreen), colorize(redactJSONBody(raw), ansiCyan))
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -394,7 +486,7 @@ func writeError(w http.ResponseWriter, status int, typ, msg string) {
 
 func writeErrorWithCode(w http.ResponseWriter, status int, typ, code, msg string) {
 	if debugMode {
-		log.Printf("%s %s %d %s: %s", colorize("[DEBUG]", ansiDim), colorize(">> error", ansiRed), status, typ, msg)
+		log.Printf("%s %s %d %s: %s", colorize("[DEBUG]", ansiDim), colorize(">> error", ansiRed), status, typ, redactText(msg))
 	}
 	errorBody := map[string]any{
 		"message": msg,
@@ -412,9 +504,22 @@ func writeErrorWithCode(w http.ResponseWriter, status int, typ, code, msg string
 func writeSSE(w http.ResponseWriter, flusher http.Flusher, chunk ChatStreamChunk) {
 	data, _ := json.Marshal(chunk)
 	if debugMode {
-		log.Printf("%s %s %s", colorize("[DEBUG]", ansiDim), colorize(">> sse", ansiGreen), colorize(string(data), ansiCyan))
+		log.Printf("%s %s %s", colorize("[DEBUG]", ansiDim), colorize(">> sse", ansiGreen), colorize(redactJSONBody(data), ansiCyan))
 	}
-	fmt.Fprintf(w, "data: %s\n\n", data)
+	writeDownstream(w, flusher, fmt.Sprintf("data: %s\n\n", data))
+}
+
+// writeDownstream writes and flushes one SSE payload. net/http's Write already
+// applies backpressure (it blocks while the client's socket buffer is full), so
+// the optional deadline is the only thing layered on top: when enabled, a
+// stalled reader is disconnected and the upstream is torn down with it.
+func writeDownstream(w http.ResponseWriter, flusher http.Flusher, payload string) {
+	if clientDrainTimeout > 0 {
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(clientDrainTimeout))
+	}
+	if _, err := io.WriteString(w, payload); err != nil {
+		return
+	}
 	flusher.Flush()
 }
 
@@ -427,10 +532,9 @@ func writeSSEError(w http.ResponseWriter, flusher http.Flusher, code, message st
 	}}
 	data, _ := json.Marshal(payload)
 	if debugMode {
-		log.Printf("%s %s %s", colorize("[DEBUG]", ansiDim), colorize(">> sse error", ansiRed), colorize(string(data), ansiCyan))
+		log.Printf("%s %s %s", colorize("[DEBUG]", ansiDim), colorize(">> sse error", ansiRed), colorize(redactJSONBody(data), ansiCyan))
 	}
-	fmt.Fprintf(w, "data: %s\n\n", data)
-	flusher.Flush()
+	writeDownstream(w, flusher, fmt.Sprintf("data: %s\n\n", data))
 }
 
 func streamEventText(ev CCStreamEvent) string {

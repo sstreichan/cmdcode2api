@@ -51,12 +51,11 @@ func authMiddleware(cfg *Config, keys *ClientKeyPool) func(http.Handler) http.Ha
 				next.ServeHTTP(w, r)
 				return
 			}
-			auth := r.Header.Get("Authorization")
-			if !strings.HasPrefix(auth, "Bearer ") {
-				writeError(w, 401, "authentication_error", "missing Authorization header")
+			key := clientKeyFromHeaders(r.Header)
+			if key == "" || strings.HasPrefix(key, "sk-") {
+				writeError(w, 401, "authentication_error", "invalid API key")
 				return
 			}
-			key := strings.TrimPrefix(auth, "Bearer ")
 			ck := keys.Lookup(key)
 			if ck == nil || !ck.Enabled {
 				writeError(w, 401, "authentication_error", "invalid API key")
@@ -144,7 +143,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, x-cmd-zdr")
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(204)
 			return
@@ -201,17 +200,22 @@ func runServer(cc *CCClient, cfg *Config, usage *UsageTracker, ring *logRing) er
 
 	var handler http.Handler = mux
 	handler = authMiddleware(cfg, keys)(handler)
+	// In-flight cap sits after auth (unauthenticated requests never count) and
+	// before logging, so a rejected request is still visible in the log.
+	handler = applyInflightLimit(handler)
 	handler = securityHeaders()(handler)
 	handler = loggingMiddleware(handler)
 	handler = corsMiddleware(handler)
 
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	// No read/write walls: streaming responses and >30s base64 image uploads
+	// must not be cut off. ReadHeaderTimeout still bounds header floods, and
+	// the idle watchdogs bound a stalled upstream.
 	srv := &http.Server{
-		Addr:         addr,
-		Handler:      handler,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 600 * time.Second, // 流式响应需要长超时
-		IdleTimeout:  120 * time.Second,
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	shutdownSignal, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -244,6 +248,7 @@ func runServer(cc *CCClient, cfg *Config, usage *UsageTracker, ring *logRing) er
 		}
 	}
 	log.Printf("models: %d loaded, %d available", loadedModels, availableCount)
+	logRobustnessConfig()
 	if cfg.WebUIEnabled() {
 		log.Printf("webui available at http://%s/webui", addr)
 	}

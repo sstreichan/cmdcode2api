@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"sync"
 
@@ -156,6 +157,17 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if len(cfg.APIKeys) == 0 && cfg.APIKey != "" {
 		cfg.APIKeys = []ClientKeyConfig{{Name: "default", Key: cfg.APIKey}}
+	}
+	// The load path is warn-only: existing installations with a differently
+	// shaped credential keep working, and the account stays enabled. Strict
+	// validation applies the next time the key is written.
+	for _, account := range cfg.CommandCode.Accounts {
+		if account.APIKey == "" {
+			continue
+		}
+		if _, err := normalizeAccountKey(account.APIKey); err != nil {
+			log.Printf("[WARN] account %q: %v; keeping it enabled (strict validation applies on edit)", account.Name, err)
+		}
 	}
 	return &cfg, nil
 }

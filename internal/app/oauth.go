@@ -56,6 +56,11 @@ type OAuthFlow struct {
 	mu     sync.Mutex
 	result *oauthCallback
 	err    error
+
+	// onSuccess runs once, synchronously, before the flow becomes observable
+	// as done. Callers polling StateName therefore never see "success" before
+	// the credential has actually been persisted.
+	onSuccess func(oauthCallback) error
 }
 
 // generateState 生成随机 state token 防 CSRF
@@ -278,13 +283,24 @@ func (f *OAuthFlow) Wait(timeout time.Duration) (oauthCallback, error) {
 	}
 }
 
-// Cancel aborts a pending flow. It is safe to call at any time.
+// Cancel aborts a pending flow. It is safe to call at any time. The failure is
+// recorded synchronously so a status poll right after Cancel already sees
+// "failed" instead of racing the Wait goroutine.
 func (f *OAuthFlow) Cancel() {
+	err := fmt.Errorf("OAuth flow canceled")
 	select {
-	case f.errCh <- fmt.Errorf("OAuth flow canceled"):
+	case f.errCh <- err:
 	default:
 	}
-	f.finish(nil)
+	f.finish(err)
+}
+
+// SetOnSuccess registers the completion hook. It must be set before the flow
+// can succeed and runs at most once, under finish.
+func (f *OAuthFlow) SetOnSuccess(hook func(oauthCallback) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onSuccess = hook
 }
 
 // finish marks the flow complete exactly once and releases the listener.
@@ -297,6 +313,26 @@ func (f *OAuthFlow) finish(err error) {
 		f.mu.Unlock()
 	}
 	f.closeOnce.Do(func() {
+		// Side effects run before close(done): anything polling StateName must
+		// not observe "success" until the account exists and is persisted.
+		f.mu.Lock()
+		hook := f.onSuccess
+		currentErr := f.err
+		var result *oauthCallback
+		if f.result != nil {
+			r := *f.result
+			result = &r
+		}
+		f.mu.Unlock()
+		if hook != nil && currentErr == nil && result != nil {
+			if hookErr := hook(*result); hookErr != nil {
+				f.mu.Lock()
+				if f.err == nil {
+					f.err = hookErr
+				}
+				f.mu.Unlock()
+			}
+		}
 		close(f.done)
 		if f.server != nil {
 			_ = f.server.Close()

@@ -11,7 +11,7 @@ go build -o cmdcode2api ./cmd/cmdcode2api
 ## Docker
 
 CI 会在每次 master 推送（`latest` 标签）和 `v*` 标签时自动发布多架构镜像到
-GHCR。`config.yaml` 和 `usage.json` 放在 `/data` 数据卷中：
+GHCR。`config.yaml`、`usage.json`、`detection.json` 放在 `/data` 数据卷中：
 
 ```bash
 docker run -d --name cmdcode2api -p 11434:11434 -v cmdcode2api-data:/data ghcr.io/peach0x33a/cmdcode2api:latest
@@ -128,6 +128,29 @@ ssh -L 5959:127.0.0.1:5959 root@your-server
 - 每把密钥独立统计请求数与 token 用量，持久化在 `usage.json` 的 `client_keys` 字段，也在 `/usage` 中可见；
 - 旧的单一 `api_key` 字段继续有效，加载时自动迁移为名为 `default` 的一把密钥。
 
+## 客户端仿真状态（detection.json）
+
+为了让上游看到的行为与官方 CLI 一致，每个账号各自维护一份设备指纹和会话：
+
+- 每个 Key 的首次请求（以及刷新窗口到期后）会先并行发送指纹记录
+  （`POST /alpha/fingerprint/record`）和生命周期事件
+  （`POST /alpha/lifecycle-events`），再发 completion。握手失败不会阻塞
+  completion，只有 `401`/`403` 会禁用该账号。
+- 每个 Key 复用一个会话 id 作为 `x-session-id`（若客户端自带
+  `x-session-id`/`x-claude-code-session-id`/`session_id`/`prompt_cache_key`，
+  以客户端的为准）。会话每 12 小时 + 最多 1 小时抖动轮换一次；会话轮换时
+  同时重新录制指纹。
+- 状态以下游账号的哈希 id 为键保存在 `config.yaml` 同目录的
+  `detection.json` 中，重启后继续沿用，且绝不会写入原始 Key。修改账号 Key
+  会丢弃旧状态（多个 Key 共用一份画像会让账号在上游可关联），重命名则保留。
+- `detection.json` 缺失属于正常首次启动；文件损坏会打印 `[WARN]` 并重建。
+- WebUI「账号」页展示指纹短形式、设备画像、下次刷新时间和会话到期时间，
+  并提供「重录指纹」（一次 fingerprint 调用）和「新会话」
+  （一次 lifecycle 调用）。
+
+`detection.json` 是运行时状态而非配置：不出现在 `config.yaml` 中，无需迁移，
+删除它只会触发一次重新录制。
+
 ## WebUI 管理台
 
 `webui` 启用（默认）时，二进制会在 `/webui` 路径托管内嵌的单文件管理界面
@@ -142,11 +165,11 @@ http://localhost:11434/webui
 
 功能：
 
-- **概览**：版本、运行时长、监听地址、用量统计、账号/密钥/模型概览、额度同步汇总（已同步 / 超限 / 低余额账号数、最近刷新时间）
-- **账号**：添加（粘贴 Key 或 OAuth，OAuth 支持填写回调地址）、编辑名称/Key、启用/禁用、连通性测试、刷新额度、删除；展示每账号请求数、tokens、错误、冷却状态、最近错误，以及额度（5 小时 / 周 / 按月估算进度条、余额、套餐、账期）。OAuth 添加的账号按登录账号名自动命名
+ - **概览**：版本、运行时长、监听地址、用量统计、账号/密钥/模型概览、额度同步汇总（已同步 / 超限 / 低余额账号数、最近刷新时间）
+ - **账号**：添加（粘贴 Key 或 OAuth，OAuth 支持填写回调地址）、编辑名称/Key、启用/禁用、连通性测试、刷新额度、删除；展示每账号请求数、tokens、错误、冷却状态、最近错误，以及额度（5 小时 / 周 / 按月估算进度条、余额、套餐、账期）。OAuth 添加的账号按登录账号名自动命名。「指纹 / 会话」列展示指纹短形式、下次刷新与会话到期时间，并提供「重录指纹」「新会话」操作
 - **模型**：上游模型复选框列表，勾选 = 对外提供（`/v1/models` 可见、可调用），取消勾选 = 隐藏并拒绝调用；本页即 exclude_models 的可视化编辑器，改动即时生效
 - **密钥**：新建调用本网关的客户端 API Key（服务端自动生成，不支持手动指定值）、复制、启用/禁用、删除；每把密钥独立的请求与 token 统计。列表中密钥默认打码，可按需显示/复制（完整值仅在创建时展示一次）
-- **设置**：`base_url`（即时生效）、`host`/`port`/`webui`（写盘后重启生效）、修改管理密码（需提供原密码，成功后踢出所有已登录管理会话）；exclude_models 已移至「模型」页维护
+- **设置**：`base_url`（即时生效）、`host`/`port`/`webui`（写盘后重启生效）、查看当前对外声明的 CLI 版本（来自 npm，支持手动刷新）、修改管理密码（需提供原密码，成功后踢出所有已登录管理会话）；exclude_models 已移至「模型」页维护
 - **日志**：内存日志环形缓冲（最近 500 行）实时查看
 
 账号与设置的修改会立即写回 `config.yaml`，无需重启。
@@ -184,8 +207,11 @@ POST   /admin/api/accounts             {"name": "...", "api_key": "..."}
 PATCH  /admin/api/accounts/{id}        {"enabled": true} 或 {"name": "..."}
 DELETE /admin/api/accounts/{id}
 POST   /admin/api/accounts/{id}/test
+POST   /admin/api/accounts/{id}/fingerprint   重新录制设备指纹
+POST   /admin/api/accounts/{id}/session       轮换该 Key 的会话
 POST   /admin/api/accounts/{id}/quota/refresh
 POST   /admin/api/quotas/refresh       {"id": "..."} 可选，省略则刷新全部账号
+GET    /admin/api/detection
 GET    /admin/api/models
 PUT    /admin/api/models               {"exposed": ["model-id", ...]}
 GET    /admin/api/keys
@@ -195,6 +221,8 @@ PATCH  /admin/api/keys/{id}            {"enabled": true} 或 {"name": "..."}
 DELETE /admin/api/keys/{id}
 GET    /admin/api/settings
 PUT    /admin/api/settings
+GET    /admin/api/cliversion
+POST   /admin/api/cliversion/refresh
 GET    /admin/api/logs?after=SEQ
 POST   /admin/api/oauth/start
 GET    /admin/api/oauth/status
@@ -355,6 +383,26 @@ curl http://localhost:11434/v1/chat/completions \
 `data:image/...;base64,...` 形式。远程 HTTP(S) 图片地址会返回
 `400 invalid_request_error`，服务不会主动下载远程图片。
 
+客户端可用 `Authorization: Bearer <local-api-key>` 或
+`x-api-key: <local-api-key>` 鉴权。上游以 0 输出 token 结束的响应会返回
+`429 rate_limit_error` + `Retry-After: 10`，而不是空的 `200`；超过 100 MB 的
+请求体返回 `413`。上游状态码也会归一化：`402` → `429`、`403` → `401`
+（`authentication_error`）、`422` → `400`、`500`/`502` → `502`
+（`upstream_error`）、`503` → `503`（`temporarily_unavailable`）。
+
+## 环境变量
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `CC_STREAM_IDLE_MS` | `30000` | 流式响应的空闲看门狗，每个上游 chunk（含 `:` keepalive 行）都会重置。超时：首个帧之前返回 `429 rate_limit_error` + `Retry-After: 5`，之后发送 SSE 错误帧并关闭连接（不发 `[DONE]`）。设为 `0` 关闭。 |
+| `CC_NONSTREAM_IDLE_MS` | `90000` | `stream: false` 的同一空闲看门狗。 |
+| `CC_MAX_INFLIGHT` | `0`（关闭） | 并发 chat 请求上限；超出返回 `503 server_busy` + `Retry-After: 5`，`/health` 不计入也不受限。 |
+| `CC_CLIENT_DRAIN_TIMEOUT_MS` | `0`（关闭） | 下游读端停滞时的可选写超时。默认关闭：客户端「阻塞在工具执行」与真正停滞无法区分。 |
+| `CMD_ZDR` | 未设置 | 设为 `1`/`true` 时在 completion 与握手上发送 `x-cmd-zdr: 1`（零数据保留路由）；单次请求也可用 `x-cmd-zdr: 1` 自行开启。 |
+
+空闲看门狗是「空闲」超时而非总预算：稳定但缓慢的流不会触发。连续三次超时后，
+错误信息会附上「建议压缩上下文」的提示。
+
 ## 本地运行产物
 
 以下文件不应该提交到 Git：
@@ -363,6 +411,7 @@ curl http://localhost:11434/v1/chat/completions \
 cmdcode2api
 config.yaml
 usage.json
+detection.json
 .oauth_state
 .oauth_url
 ```

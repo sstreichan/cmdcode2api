@@ -74,7 +74,7 @@
   td { padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top; font-size: 13px; }
   tr:last-child td { border-bottom: none; }
   td.num { font-family: var(--mono); font-size: 12.5px; }
-  .row-actions { display: flex; gap: 6px; justify-content: flex-end; }
+  .row-actions { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
 
   .badge {
     display: inline-block; padding: 2px 9px; border-radius: 20px;
@@ -230,6 +230,11 @@
   /* each account's main row and its quota/usage detail read as one block */
   tbody.acc-group tr > td { border-bottom: none; }
   tbody.acc-group + tbody.acc-group tr:first-child > td { border-top: 1px solid var(--border); }
+
+  /* wide tables scroll inside their panel instead of stretching past it */
+  #acc-table, #ck-table { overflow-x: auto; }
+  #acc-table table { min-width: 1000px; }
+
 </style>
 </head>
 <body>
@@ -357,6 +362,13 @@
         <span class="cap" data-i18n="set.baseUrl">Base URL (applies immediately)</span>
         <input type="text" id="set-baseurl" class="mono">
       </label>
+       <div class="form-row" style="margin-top:10px">
+         <label class="field"><span class="cap" data-i18n="set.cliVersion"></span>
+           <input type="text" id="set-cliver" class="mono" readonly>
+         </label>
+         <button class="btn" id="set-cliver-refresh" data-i18n="set.cliVersionRefresh"></button>
+       </div>
+       <p class="hint" data-i18n="set.cliVersionHint"></p>
     </div>
     <div class="panel">
       <h3 data-i18n="set.service">Service</h3>
@@ -614,6 +626,14 @@ const I18N = {
     "acc.editTitle": "Edit account",
     "acc.editKeyLabel": "API key (leave blank to keep current)",
     "acc.editHint": "Changing the key changes the account ID; usage stats migrate to the new ID automatically.",
+    "acc.fingerprint": "Fingerprint / Session",
+    "acc.reRecord": "Re-record fingerprint",
+    "acc.newSession": "New session",
+    "acc.fingerprintRec": "Fingerprint re-recorded.",
+    "acc.fingerprintRecError": "Fingerprint re-recorded, but upstream returned an error: {error}",
+    "acc.sessionCreated": "New session created.",
+    "acc.sessionCreatedError": "Session rotated, but upstream returned an error: {error}",
+    "acc.sessionUntil": "session until {time}",
 
     "models.title": "Exposed models",
     "models.search": "Search models…",
@@ -654,6 +674,13 @@ const I18N = {
     "set.restartNote": "⚠ Written to config; these fields take effect after a restart: {fields}",
     "set.fillPasswords": "Enter the current and the new password.",
     "set.passwordChanged": "Admin password changed, please sign in again with the new password.",
+    "set.cliVersion": "CLI version (x-command-code-version)",
+    "set.cliVersionRefresh": "Refresh",
+    "set.cliVersionHint": "Version auto-refreshes from the npm registry every 24h; on failure, the cached or built-in fallback value is used. This does not affect requests.",
+    "set.cliVersionNpm": "npm",
+    "set.cliVersionFallback": "built-in fallback",
+    "set.cliVersionRefreshFail": "Refresh failed, keeping {version}: {error}",
+    "set.cliVersionRefreshed": "CLI version refreshed: {version}",
 
     "logs.title": "Recent logs (last 500 lines kept in memory)",
     "logs.autoScroll": "Auto-scroll",
@@ -828,6 +855,14 @@ const I18N = {
     "acc.editTitle": "编辑账号",
     "acc.editKeyLabel": "API Key（留空表示不修改）",
     "acc.editHint": "更换 Key 后账号 ID 会变化，用量统计会自动迁移到新 ID。",
+    "acc.fingerprint": "指纹 / 会话",
+    "acc.reRecord": "重录指纹",
+    "acc.newSession": "新建会话",
+    "acc.fingerprintRec": "指纹已重录",
+    "acc.fingerprintRecError": "指纹已重录，但上游返回错误：{error}",
+    "acc.sessionCreated": "已创建新会话",
+    "acc.sessionCreatedError": "会话已轮换，但上游返回错误：{error}",
+    "acc.sessionUntil": "会话至 {time}",
 
     "models.title": "对外暴露的模型",
     "models.search": "搜索模型…",
@@ -868,6 +903,13 @@ const I18N = {
     "set.restartNote": "⚠ 已写入配置，以下字段需要重启服务后生效：{fields}",
     "set.fillPasswords": "请填写当前密码和新密码",
     "set.passwordChanged": "管理密码已修改，请用新密码重新登录",
+    "set.cliVersion": "CLI 版本（x-command-code-version）",
+    "set.cliVersionRefresh": "刷新",
+    "set.cliVersionHint": "版本每 24 小时自动从 npm registry 刷新；失败时沿用缓存或内置回退值，不会影响请求。",
+    "set.cliVersionNpm": "npm",
+    "set.cliVersionFallback": "内置回退",
+    "set.cliVersionRefreshFail": "刷新失败，沿用 {version}：{error}",
+    "set.cliVersionRefreshed": "CLI 版本已刷新：{version}",
 
     "logs.title": "最近日志（内存保留 500 行）",
     "logs.autoScroll": "自动滚动",
@@ -1339,6 +1381,7 @@ function renderAccounts(accounts) {
       <th style="text-align:right">${esc(t("common.tokens"))}</th>
       <th style="text-align:right">${esc(t("common.errors"))}</th>
       <th>${esc(t("common.lastUsed"))}</th>
+      <th>${esc(t("acc.fingerprint"))}</th>
       <th style="text-align:right">${esc(t("common.actions"))}</th>
     </tr></thead>
     ${accounts.map(a => {
@@ -1352,16 +1395,19 @@ function renderAccounts(accounts) {
         <td class="num" style="text-align:right">${fmtTokens(tokens)}</td>
         <td class="num" style="text-align:right">${a.errors ? `<span style="color:var(--red)">${a.errors}</span>` : "0"}</td>
         <td class="nowrap dim">${esc(relTime(a.last_used_at))}</td>
+        <td class="mono dim" title="${esc(a.fingerprint_profile ? (a.fingerprint_profile.cpu_model + " · " + a.fingerprint_profile.memory_gib + " GiB · " + a.fingerprint_profile.timezone) : "")}">${a.fingerprint_short ? esc(a.fingerprint_short) + "<br><span class='faint'>" + t("acc.sessionUntil", { time: inTime(a.session_expires_at) }) + "</span>" : "—"}</td>
         <td><div class="row-actions">
           <button class="btn small" onclick="refreshAccountQuota('${a.id}')">${esc(t("quota.refreshOne"))}</button>
           <button class="btn small" onclick="testAccount('${a.id}')">${esc(t("common.test"))}</button>
           <button class="btn small" onclick="openAccountEdit('${a.id}', '${esc(a.name)}')">${esc(t("common.edit"))}</button>
+          <button class="btn small" onclick="reRecordAccount('${a.id}')">${esc(t("acc.reRecord"))}</button>
+          <button class="btn small" onclick="newAccountSession('${a.id}')">${esc(t("acc.newSession"))}</button>
           <button class="btn small" onclick="toggleAccount('${a.id}', ${a.enabled ? "false" : "true"})">${a.enabled ? esc(t("common.disable")) : esc(t("common.enable"))}</button>
           <button class="btn small danger" onclick="deleteAccount('${a.id}', '${esc(a.name)}')">${esc(t("common.delete"))}</button>
         </div></td>
       </tr>
-      <tr class="acc-quota"><td colspan="8" style="padding-top:10px;padding-bottom:5px">${quotaDetail(a)}</td></tr>
-      ${a.last_error ? `<tr><td colspan="8" class="err-line">${esc(t("acc.lastError", { time: relTime(a.last_error_at), msg: a.last_error }))}</td></tr>` : ""}
+      <tr class="acc-quota"><td colspan="9" style="padding-top:10px;padding-bottom:5px">${quotaDetail(a)}</td></tr>
+      ${a.last_error ? `<tr><td colspan="9" class="err-line">${esc(t("acc.lastError", { time: relTime(a.last_error_at), msg: a.last_error }))}</td></tr>` : ""}
     </tbody>`;}).join("")}
   </table>`;
 }
@@ -1374,6 +1420,24 @@ async function addAccount() {
     await api("/admin/api/accounts", { method: "POST", body: { name, api_key: key } });
     $("#acc-key").value = ""; $("#acc-name").value = "";
     toast(t("acc.added"));
+    refreshAll();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function reRecordAccount(id) {
+  try {
+    const r = await api("/admin/api/accounts/" + id + "/fingerprint", { method: "POST" });
+    if (r.error) toast(t("acc.fingerprintRecError", { error: r.error }), true);
+    else toast(t("acc.fingerprintRec"));
+    refreshAll();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function newAccountSession(id) {
+  try {
+    const r = await api("/admin/api/accounts/" + id + "/session", { method: "POST" });
+    if (r.error) toast(t("acc.sessionCreatedError", { error: r.error }), true);
+    else toast(t("acc.sessionCreated"));
     refreshAll();
   } catch (e) { toast(e.message, true); }
 }
@@ -1599,6 +1663,24 @@ async function loadSettings() {
     $("#set-password").value = "";
     $("#set-password-old").value = "";
   } catch (e) { /* 401 already handled */ }
+  loadCLIVersion();
+}
+
+async function loadCLIVersion() {
+  try {
+    const v = await api("/admin/api/cliversion");
+    $("#set-cliver").value = v.version + " · " + (v.source === "npm" ? t("set.cliVersionNpm") : t("set.cliVersionFallback"));
+  } catch (e) { /* 401 already handled */ }
+}
+
+async function refreshCLIVersion() {
+  try {
+    const v = await api("/admin/api/cliversion/refresh", { method: "POST" });
+    const src = v.source === "npm" ? t("set.cliVersionNpm") : t("set.cliVersionFallback");
+    $("#set-cliver").value = v.version + " · " + src;
+    if (v.error) toast(t("set.cliVersionRefreshFail", { version: v.version, error: v.error }), true);
+    else toast(t("set.cliVersionRefreshed", { version: v.version }));
+  } catch (e) { toast(e.message, true); }
 }
 
 function renderRestartNote() {
@@ -1759,6 +1841,7 @@ $("#oauth-cancel").addEventListener("click", () => {
 $("#oauth-modal").addEventListener("click", e => { if (e.target === $("#oauth-modal")) hideModal("#oauth-modal"); });
 
 $("#set-save-btn").addEventListener("click", saveSettings);
+$("#set-cliver-refresh").addEventListener("click", refreshCLIVersion);
 
 $("#pw-form").addEventListener("submit", async e => {
   e.preventDefault();
